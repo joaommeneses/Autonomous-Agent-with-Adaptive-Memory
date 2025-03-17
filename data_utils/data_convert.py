@@ -223,10 +223,10 @@ for trid in task_real_ids:
                 "test": test_data_by_task}
     for split in all_data:
         data = all_data[split][trid]
-        with open(f"{args.dir}/data_dir/{mode}.{trid}.{split}.json", 'w') as f:
+        with open(f"{args.dir}/data_dir/{mode}.{trid}.{split}.jsonl", 'w') as f:
             for item in data:
                 f.write(json.dumps(item) + "\n") 
         if split == "val":
-            with open(f"{args.dir}/data_dir/{mode}.{trid}.{split}.mini.json", 'w') as f:
+            with open(f"{args.dir}/data_dir/{mode}.{trid}.{split}.mini.jsonl", 'w') as f:
                 for item in data[:2000]:
                     f.write(json.dumps(item) + "\n") 
