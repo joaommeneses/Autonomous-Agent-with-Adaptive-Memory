@@ -194,15 +194,15 @@ action_counter = Counter([a.split()[0] for a in all_actions])
 for value, count in sorted(action_counter.items(), key=lambda x: x[1], reverse=True):
     print(f"{value}: {count}")
 
-with open(f"{args.dir}/{mode}.train.jsonl", 'w') as f:
+with open(f"{args.dir}/{mode}.train.jsonl", 'w+') as f:
     for item in train_data:
         f.write(json.dumps(item) + "\n")
 
-with open(f"{args.dir}/{mode}.val.jsonl", 'w') as f:
+with open(f"{args.dir}/{mode}.val.jsonl", 'w+') as f:
     for item in val_data:
         f.write(json.dumps(item) + "\n")
 
-with open(f"{args.dir}/{mode}.val.mini.jsonl", 'w') as f:
+with open(f"{args.dir}/{mode}.val.mini.jsonl", 'w+') as f:
     import random
     random.seed(1)
     random.shuffle(val_data)
@@ -210,7 +210,7 @@ with open(f"{args.dir}/{mode}.val.mini.jsonl", 'w') as f:
     for item in val_data:
         f.write(json.dumps(item) + "\n")
 
-with open(f"{args.dir}/{mode}.test.jsonl", 'w') as f:
+with open(f"{args.dir}/{mode}.test.jsonl", 'w+') as f:
     for item in test_data:
         f.write(json.dumps(item) + "\n") 
 
@@ -223,10 +223,10 @@ for trid in task_real_ids:
                 "test": test_data_by_task}
     for split in all_data:
         data = all_data[split][trid]
-        with open(f"{args.dir}/data_dir/{mode}.{trid}.{split}.jsonl", 'w') as f:
+        with open(f"{args.dir}/data_dir/{mode}.{trid}.{split}.jsonl", 'w+') as f:
             for item in data:
                 f.write(json.dumps(item) + "\n") 
         if split == "val":
-            with open(f"{args.dir}/data_dir/{mode}.{trid}.{split}.mini.jsonl", 'w') as f:
+            with open(f"{args.dir}/data_dir/{mode}.{trid}.{split}.mini.jsonl", 'w+') as f:
                 for item in data[:2000]:
                     f.write(json.dumps(item) + "\n") 
