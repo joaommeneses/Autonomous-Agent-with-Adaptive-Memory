@@ -417,7 +417,7 @@ def findValidActionWithSystem2(predictions, env, task_id, task_description, look
                                recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
                                demo_data, logger, sbert_model, step, last_time_system2_steps, 
                                useful_focus_on, focus_on_done, force_system_1, force_system_2, 
-                               gpt_version="gpt-4", llm=None):
+                               gpt_version="gemini-2.5-flash-preview-04-17", llm=None):
     
     inventory = env.inventory()
     #### Done preparing valid actions #### 
@@ -487,7 +487,7 @@ def findValidActionWithSystem2(predictions, env, task_id, task_description, look
     else:
         fast_action = None
     
-    logger.info("Now, start using System 2: OpenAI for reasoning")  
+    logger.info("Now, start using System 2: Gemini for reasoning")  
     real_action_list = []
     try:
         enc = tiktoken.encoding_for_model(gpt_version)
@@ -495,9 +495,11 @@ def findValidActionWithSystem2(predictions, env, task_id, task_description, look
         demos = demo_data[str(task_id)]
         
         prompt_to_plan = compose_prompt_to_plan(demos, useful_focus_on, task_description, recent_actions, recent_obs, recent_locs, recent_looks, failed_messages, look, inventory, fast_action, version="full")  
-        if gpt_version == "gpt-3.5-turbo":
+        if gpt_version.startswith("gemini-2.5"):
             length = len(enc.encode(prompt_to_plan))
-            if length >= 4000:
+            # Gemini Flash 2.5 has a ~32k token context window;
+            # still want a lite fallback, pick threshold (e.g. 24000)
+            if length >= 28000:
                 prompt_to_plan = compose_prompt_to_plan(demos, useful_focus_on, task_description, recent_actions, recent_obs, recent_locs, recent_looks, failed_messages, look, inventory, fast_action, version="lite")  
 
         logger.info("-"*30 + "prompt_to_plan" + "-"*30)
@@ -570,7 +572,7 @@ def findValidActionWithSystem2(predictions, env, task_id, task_description, look
             return real_action_list, guess_obs_list
         real_action_list, guess_obs_list = post_process(response_next_actions)
     except Exception as e:
-        logger.info("OpenAI error:" + str(e))
+        logger.info("Gemini error:" + str(e))
         
     if len(real_action_list) == 0:
         logger.info("Error from System 2. Try again.")
@@ -610,7 +612,7 @@ def findValidActionWithSystem2(predictions, env, task_id, task_description, look
     # TODO: select the action 
     return True, (real_action_list, guess_obs_list)
 
-def compose_prompt_to_nextactions(demos, task_desc, recent_actions, recent_obs, recent_locs, failed_messages, look, inventory, response_next_subgoal, useful_focus_on, fast_action=None, k=10, version="gpt-4"):
+def compose_prompt_to_nextactions(demos, task_desc, recent_actions, recent_obs, recent_locs, failed_messages, look, inventory, response_next_subgoal, useful_focus_on, fast_action=None, k=10, version="gemini-2.5-flash-preview-04-17"):
 
     prompt_to_next_actions = []
     prompt_to_next_actions.append("You are an experienced teacher who always guide students to complete the science experiments. Now let's do science experiments with a sequence of actions.")
