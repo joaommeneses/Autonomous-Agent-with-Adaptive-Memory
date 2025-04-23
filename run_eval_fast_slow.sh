@@ -1,7 +1,7 @@
 num_gpus=$1  
 seed=42
 split="test_mini"
-gpt_version="gpt-3.5-turbo"
+gpt_version="gemini-2.5-flash-preview-04-17"
 # gpt_version="gpt-4"
 
 
