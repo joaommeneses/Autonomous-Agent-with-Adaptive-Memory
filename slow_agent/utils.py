@@ -1,6 +1,6 @@
 
 # from openai_key import OPENAI_KEY
-import openai 
+import google.generativeai as genai
 import os
 import json
 import random
@@ -10,12 +10,12 @@ from tenacity import (
     wait_random_exponential,
 )  # for exponential backoff
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
  
 
 @retry(wait=wait_random_exponential(min=1, max=10), stop=stop_after_attempt(10))
 def completion_with_backoff(**kwargs):
-    return openai.ChatCompletion.create(**kwargs) 
+    return genai.chat.completions.create(**kwargs)
 
 
     triplets_by_task = load_triplets()
