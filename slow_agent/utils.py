@@ -1,23 +1,14 @@
 
-# from openai_key import OPENAI_KEY
-import google.generativeai as genai
+from google import genai
 import os
-import json
-import random
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_random_exponential,
-)  # for exponential backoff
+from tenacity import retry, stop_after_attempt, wait_random_exponential
 
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
- 
+# instantiate a single client with your API key (or read from ENV)
+genai_client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
 
 @retry(wait=wait_random_exponential(min=1, max=10), stop=stop_after_attempt(10))
-def completion_with_backoff(**kwargs):
-    return genai.chat.completions.create(**kwargs)
-
-
-    triplets_by_task = load_triplets()
-    prompt = sample_few_shot(triplets_by_task, "0")
-    print(prompt)
+def completion_with_backoff(*, model, messages, n=1, temperature=0, top_p=1):
+    return genai_client.models.generate_content(
+        model=model,
+        contents=messages
+    )
