@@ -413,204 +413,158 @@ def try_to_replace(action, validActions, look=None, inventory=None):
     return action 
         
 
-def findValidActionWithSystem2(predictions, env, task_id, task_description, look, 
-                               recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
-                               demo_data, logger, sbert_model, step, last_time_system2_steps, 
-                               useful_focus_on, focus_on_done, force_system_1, force_system_2, 
-                               gpt_version="gemini-2.5-flash-preview-04-17", llm=None):
-    
+import openai  # make sure this is at the top of the file
+
+def findValidActionWithSystem2(
+    predictions, env, task_id, task_description, look,
+    recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
+    demo_data, logger, sbert_model, step, last_time_system2_steps,
+    useful_focus_on, focus_on_done, force_system_1, force_system_2,
+    gpt_version="gemini-2.5-flash-preview-04-17", llm=None
+):
     inventory = env.inventory()
-    #### Done preparing valid actions #### 
     validActions = getFilteredValidActions(env, look, task_id=task_id, task_desc=task_description)
-    enable_system2 = True 
+    enable_system2 = True
 
-    # if not force_system_2:
-    if True:
-        # 1) if acton in top 3 is valid, try to choose it
-        found_valid_in_top = False
-        action = None
-        if recent_actions[-1].startswith("wait") and predictions[0].startswith("wait"):
-            predictions = predictions[1:]
-        for pred in predictions[:1]:
-            # pred = pred.replace("green house", "greenhouse") 
-            pred = try_to_replace(pred, validActions, look, inventory)
-            action = pred.strip()
-            if pred.strip().startswith("focus on") and focus_on_done:
-                break 
-            if pred.strip() in validActions:
-                found_valid_in_top = True
-                break
-        
-        
-         
-        logger.info(f"found_valid_in_top={found_valid_in_top} ({action}) ") 
-        
+    # Fast‐agent heuristics
+    found_valid_in_top = False
+    action = None
+    if recent_actions and predictions and recent_actions[-1].startswith("wait") and predictions[0].startswith("wait"):
+        predictions = predictions[1:]
+    for pred in predictions[:1]:
+        pred = try_to_replace(pred, validActions, look, inventory)
+        action = pred.strip()
+        if pred.strip().startswith("focus on") and focus_on_done:
+            break
+        if pred.strip() in validActions:
+            found_valid_in_top = True
+            break
+    logger.info(f"found_valid_in_top={found_valid_in_top} ({action})")
 
-        
-        
-        if found_valid_in_top and len(recent_actions) < 10:
-            # Use fast agent in the first 10 steps
-            enable_system2 = False 
+    last_sys2 = last_time_system2_steps[-1] if last_time_system2_steps else -999
+    if found_valid_in_top and len(recent_actions) < 10:
+        enable_system2 = False
+    if found_valid_in_top and (step - last_sys2) < 5:
+        enable_system2 = False
+    if found_valid_in_top and sum(recent_reward[-5:]) > 0:
+        logger.info("Recent scores increased; skipping System 2.")
+        enable_system2 = False
+    if found_valid_in_top and action not in recent_actions[-3:]:
+        logger.info("Action not in recent 3; skipping System 2.")
+        enable_system2 = False
+    if found_valid_in_top and not enable_system2 and not force_system_2:
+        assert action is not None
+        logger.info("Using Fast System output.")
+        return False, action
 
-        if found_valid_in_top and step - last_time_system2_steps[-1] < 5:
-            # only when we did not use System 2 in the past five time steps
-            enable_system2 = False 
+    if ((not found_valid_in_top and (step - last_sys2) <= 2) or force_system_1) and not force_system_2:
+        cand_preds = [try_to_replace(p, validActions, look, inventory)
+                      for p in predictions if not p.startswith("focus on")]
+        cand_preds = cand_preds[:3]
+        trial_action = next((p for p in cand_preds if p in validActions), None)
+        trial_action = trial_action or (cand_preds[0] if cand_preds else None)
+        return False, trial_action
 
-        if found_valid_in_top and sum(recent_reward[-5:]) > 0: 
-            logger.info("Recent scores has increased in recent 5 timesteps. Not doing System 2.")
-            enable_system2 = False
-        
-        if found_valid_in_top and action not in recent_actions[-3:]:
-            logger.info("No such actions in recent 3 timesteps. Not doing System 2.")
-            enable_system2 = False 
-        
-        if found_valid_in_top and not enable_system2 and not force_system_2:
-            assert action is not None 
-            logger.info("Using Fast System output.")
-            return False, action
+    # System 2
+    assert enable_system2 or force_system_2
+    fast_action = action if found_valid_in_top else None
+    logger.info("Now, start using System 2: Gemini for reasoning")
 
-        if ((not found_valid_in_top and step - last_time_system2_steps[-1] <= 2) or force_system_1) and not force_system_2:
-            # only when we did not use System 2 in the past five time steps
-            predictions = [try_to_replace(pred, validActions, look, inventory) for pred in predictions if not pred.startswith("focus on")][:3]
-            trial_action = None
-            for pred in predictions:
-                if pred in validActions:
-                    trial_action = pred
-                    break 
-            trial_action = predictions[0] if trial_action is None and predictions else trial_action
-            return False, trial_action
-
-
-    assert enable_system2  or force_system_2
-    if found_valid_in_top:
-        fast_action = action
-    else:
-        fast_action = None
-    
-    logger.info("Now, start using System 2: Gemini for reasoning")  
     real_action_list = []
     try:
-        enc = tiktoken.encoding_for_model(gpt_version)
+        # 1) Planning
+        enc    = tiktoken.get_encoding("cl100k_base")
+        demos  = demo_data[str(task_id)]
+        prompt_to_plan = compose_prompt_to_plan(
+            demos, useful_focus_on, task_description,
+            recent_actions, recent_obs, recent_locs, recent_looks,
+            failed_messages, look, inventory, fast_action,
+            version="full"
+        )
+        # fallback to lite if too long
+        if len(enc.encode(prompt_to_plan)) >= 8000:
+            prompt_to_plan = compose_prompt_to_plan(
+                demos, useful_focus_on, task_description,
+                recent_actions, recent_obs, recent_locs, recent_looks,
+                failed_messages, look, inventory, fast_action,
+                version="lite"
+            )
 
-        demos = demo_data[str(task_id)]
-        
-        prompt_to_plan = compose_prompt_to_plan(demos, useful_focus_on, task_description, recent_actions, recent_obs, recent_locs, recent_looks, failed_messages, look, inventory, fast_action, version="full")  
-        if gpt_version.startswith("gemini-2.5"):
-            length = len(enc.encode(prompt_to_plan))
-            # Gemini Flash 2.5 has a ~32k token context window;
-            # still want a lite fallback, pick threshold (e.g. 24000)
-            if length >= 28000:
-                prompt_to_plan = compose_prompt_to_plan(demos, useful_focus_on, task_description, recent_actions, recent_obs, recent_locs, recent_looks, failed_messages, look, inventory, fast_action, version="lite")  
-
-        logger.info("-"*30 + "prompt_to_plan" + "-"*30)
-        logger.info("\n"+prompt_to_plan)
-        logger.info("-"*35 + "-"*35)
+        logger.info("PROMPT TO PLAN:\n" + prompt_to_plan)
         if llm is None:
-            response = completion_with_backoff(model=gpt_version, # try gpt-4? # gpt-3.5-turbo
-                    messages=[{"role": "user", "content": prompt_to_plan}], n = 1, temperature=0, top_p=1)
-            response_plan = response["choices"][0]["message"]["content"]
+            resp = completion_with_backoff(
+                model=gpt_version,
+                messages=[{"parts": [{"text": prompt_to_plan}]}]
+            )    
+            response_plan = resp.candidates[0].content.parts[0].text
         else:
             response_plan = local_llm.generate(prompt_to_plan, logger=logger.info)
-            
-        logger.info("-"*30 + "response_plan" + "-"*30)
-        logger.info("\n"+response_plan)
-        logger.info("-"*35 + "-"*35) 
 
-        logger.info("Sleeping for 10s.")
-        time.sleep(10)
-        ## 2) create actions    
-        prompt_to_next_actions = compose_prompt_to_nextactions(demos, task_description, 
-                                                               recent_actions, recent_obs, recent_locs, failed_messages,
-                                                                 look, inventory, response_plan, useful_focus_on, k=10, version=gpt_version)
-        logger.info("-"*30 + "prompt_to_next_actions" + "-"*30)
-        logger.info("\n"+prompt_to_next_actions)
-        logger.info("-"*35 + "-"*35)
+        logger.info("RESPONSE PLAN:\n" + response_plan)
+
+        # 2) Next actions
+        time.sleep(1)
+        prompt_to_next_actions = compose_prompt_to_nextactions(
+            demos, task_description,
+            recent_actions, recent_obs, recent_locs, failed_messages,
+            look, inventory, response_plan, useful_focus_on,
+            k=10, version=gpt_version
+        )
+        logger.info("PROMPT TO NEXT ACTIONS:\n" + prompt_to_next_actions)
         if llm is None:
-            response = completion_with_backoff(model=gpt_version,
-                    messages=[{"role": "user", "content": prompt_to_next_actions}], n = 1, temperature=0, top_p=1)
-            response_next_actions = response["choices"][0]["message"]["content"]
+            resp2 = completion_with_backoff(
+                model=gpt_version,
+                messages=[{"parts": [{"text": prompt_to_next_actions}]}],
+                temperature=0, top_p=1
+            )            
+            response_next_actions = resp2.candidates[0].content.parts[0].text
         else:
             response_next_actions = local_llm.generate(prompt_to_next_actions)
-        
-        def post_process(response_next_actions):
-            logger.info("-"*30 + "response_next_actions" + "-"*30)
-            logger.info("\n"+response_next_actions)
-            logger.info("-"*35 + "-"*35)
-            action_list = response_next_actions.split("\n")[:5] # only the take the first 10
-            logger.info(f"action_list={action_list}") 
-            real_action_list = []
-            guess_obs_list = []
-            for action in action_list:
-                if "repeat" in action.lower():
 
-                    if "wait" in real_action_list[-1].lower():
-                        todos = real_action_list[-3:]
-                        todo_obs = guess_obs_list[-3:]
-                    else:
-                        todos = real_action_list[-2:]
-                        todo_obs = guess_obs_list[-3:]
-
-                    real_action_list += todos*5
-                    guess_obs_list += todo_obs*5
-                    if "until" in action.lower():
-                        break 
+        # Post‐process
+        def post_process(text):
+            logger.info("RAW NEXT ACTIONS:\n" + text)
+            lines = text.split("\n")[:5]
+            ra, go = [], []
+            for line in lines:
+                if "repeat" in line.lower():
+                    chunk = ra[-3:] if "wait" in ra[-1].lower() else ra[-2:]
+                    obs_chunk = go[-3:]
+                    ra += chunk * 5
+                    go += obs_chunk * 5
+                    if "until" in line.lower():
+                        break
                     continue
-                if ":" not in action or "Action" not in action or "(" not in action or ")" not in action:
-                    continue 
-                start_ind = action.index(":")
-                end_ind = action.index(")")
-                if "-->" in action:
-                    guess_obs = action[action.index("-->")+3:].strip().replace("You ", "").replace(" the ", " ").replace(".", "").strip()
-                else:
-                    guess_obs = "None"
-                action = action[start_ind+1: end_ind+1].strip()
-                action = recover_action(action)
-                if action:
-                    real_action_list.append(action)
-                    guess_obs_list.append(guess_obs)
-            logger.info(f"real_action_list={real_action_list}") 
-            return real_action_list, guess_obs_list
+                if ":" not in line or "(" not in line or ")" not in line:
+                    continue
+                a = line[line.index(":")+1:line.rindex(")")+1].strip()
+                obs = line.split("-->")[-1].strip() if "-->" in line else "None"
+                a = recover_action(a)
+                if a:
+                    ra.append(a)
+                    go.append(obs)
+            logger.info(f"Parsed actions: {ra}")
+            return ra, go
+
         real_action_list, guess_obs_list = post_process(response_next_actions)
+
     except Exception as e:
-        logger.info("Gemini error:" + str(e))
-        
-    if len(real_action_list) == 0:
-        logger.info("Error from System 2. Try again.")
-        prompt_again = []
-        prompt_again.append("Your previous generation is wrong. I cannot use your output actions to complete the next subgoal or the task. Please rethink and generate the actions again. ")
-        prompt_again.append("Note that I can only do actions with available objects in the current in environment or my inventory. If the needed object are not available, please teleport to the location first.")
-        prompt_again.append("Please use the below format to organize the response.")
-        prompt_again.append("Action 1: [...] -->  \n Action 2: [...] --> \n ...")
-        prompt_again = "\n".join(prompt_again)
-        logger.info("-"*30 + "prompt_again" + "-"*30)
-        logger.info("\n"+prompt_again)
-        logger.info("-"*35 + "-"*35)
+        logger.info("Gemini planning error: " + str(e))
+        # fallback to SBERT
+        fb = try_to_replace(predictions[0], validActions, look, inventory)
+        fb_action = sbert_search([fb], validActions, sbert_model, logger)
+        return False, fb_action
 
-        if llm is None:        
-            response_v2 = completion_with_backoff(model=gpt_version,
-                    messages=[{"role": "user", "content": prompt_to_next_actions},
-                            {"role": "assistant", "content": response_next_actions},
-                            {"role": "user", "content": prompt_again},
-                            ], n = 1, temperature=0, top_p=1)
-            
-            response_next_actions_v2 = response_v2["choices"][0]["message"]["content"]
-        else:
-            # TODO: llm.generate()
-            response_next_actions_v2 = local_llm.generate(prompt_to_next_actions 
-                                                          + "### Assistant: " 
-                                                          + response_next_actions 
-                                                          + "### Human: " 
-                                                          + prompt_again) 
+    if not real_action_list:
+        # secondary fallback
+        fb = try_to_replace(predictions[0], validActions, look, inventory)
+        fb_action = sbert_search([fb], validActions, sbert_model, logger)
+        return False, fb_action
 
-        real_action_list, guess_obs_list = post_process(response_next_actions_v2)
-    if len(real_action_list) == 0:
-        logger.info("Error from System 2. Still does not work. Use Fast System (+ sbert)")
-        # if action is None:
-        action_list = [try_to_replace(predictions[0], validActions, look, inventory)]
-        action = sbert_search(action_list, list(validActions), sbert_model, logger)
-        return False, action 
-    # TODO: select the action 
     return True, (real_action_list, guess_obs_list)
+
+
+
 
 def compose_prompt_to_nextactions(demos, task_desc, recent_actions, recent_obs, recent_locs, failed_messages, look, inventory, response_next_subgoal, useful_focus_on, fast_action=None, k=10, version="gemini-2.5-flash-preview-04-17"):
 
@@ -898,18 +852,12 @@ def gpt_select_valid(action, candidates, look, inventory, goal, logger, n=1, gpt
     logger("-"*35 + "-"*35)
     if llm is None:
         responses = completion_with_backoff(model=gpt_version,
-                messages=[{"role": "user", "content": prompt_to_search},  
-                            ], n = n, temperature=0, top_p=1)
-        # logger(responses)
-        selections = [responses["choices"][i]["message"]["content"] for i in range(n)]
-    else:
+               messages=[{"parts": [{"text": prompt_to_search}]}])
+
+        selections = [responses.candidates[i].content.parts[0].text for i in range(n)]
+    else:    
         selections = local_llm.generate(prompt_to_search)
-
-    logger("\n" + "Responses: \n" + "\n".join(selections))
-
-    return selections  
-
-
+    return selections
 
 
 def rank_candidates_by_common_words(query, candidates):
