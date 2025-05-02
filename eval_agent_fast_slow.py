@@ -20,7 +20,6 @@ from collections import defaultdict
 from py4j.java_gateway import JavaGateway, GatewayParameters, launch_gateway, CallbackServerParameters
 from scienceworld.constants import BASEPATH, DEBUG_MODE, ID2TASK, JAR_PATH, NAME2ID
 from scienceworld.utils import infer_task
-from dotenv import load_dotenv
 import logging
 logger = logging.getLogger(__name__)
 
@@ -28,7 +27,6 @@ class MyScienceWorldEnv(ScienceWorldEnv):
     # it is only used for fixing the logging error --> logger.info(f"ScienceWorld server running on {port}") 
     def __init__(self, taskName=None, serverPath=None, envStepLimit=100):
         serverPath = serverPath or JAR_PATH  # Use the builtin jar.
-        load_dotenv()
 
         # Launch the server and connect to the JVM.
         # Launch Java side with dynamic port and get back the port on which the
