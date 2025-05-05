@@ -128,13 +128,19 @@ def load_variation(env, args, task_num, logger):
             variations = variations[:int(len(variations)/10)]
         elif task_num == 29: 
             variations = variations[:int(len(variations)/2)]
-    elif (args["set"] == "test"):
+    # elif (args["set"] == "test"):
+    #     variations = list(env.getVariationsTest())
+    #     if args["cut_off"]:
+    #         test_len = min(50, len(variations))
+    #         random.seed(1)
+    #         random.shuffle(variations)
+    #         variations = variations[:test_len]
+    # New condition, that matches paper eval method
+    # Use the number of variations if less than 10, use 10 if more than 10
+    elif (args["set"] == "test"):               
         variations = list(env.getVariationsTest())
-        if args["cut_off"]:
-            test_len = min(50, len(variations))
-            random.seed(1)
-            random.shuffle(variations)
-            variations = variations[:test_len]
+        if len(variations) > 5:
+            variations = variations[:5]
     elif (args["set"] == "dev"):
         variations = list(env.getVariationsDev()) 
         variations = variations[:3]
