@@ -213,15 +213,16 @@ def eval(args, task_num, logger):
             recent_looks[current_place] = info["look"]
             recent_looks_flatten.append(info["look"])
             
-            # Wait one more time 
+            # Wait one more time for delayed actions (for e.g wait for water to boil)
             if step > 3 and recent_actions[-1] == "wait" and recent_actions[-2] != "wait":
                 if recent_looks_flatten[-1] == recent_looks_flatten[-2]:
                     action = "wait"
+            # Try to use the actions from action buffer
             if action is None and len(action_buffer) > 0:
                 # debug  
                 buffer_overall_trail = 0
                 to_remove = []
-                # Try to use the actions in the buffer and see if anyone can be executed.
+                # Try to use the actions in the buffer and see if any can be executed.
                 for action_ind, action_candidate in enumerate(action_buffer):
                     if buffer_overall_trail >= 2 or (buffer_overall_trail >= 1 and action_candidate.startswith("focus on")):
                         action_buffer = []
@@ -364,6 +365,7 @@ def eval(args, task_num, logger):
                 
                 clean_recent_actions, clean_recent_obs, clean_recent_scores, clean_recent_reward, _ = \
                     clean_history(recent_actions, recent_obs, recent_scores, recent_reward, recent_locs)
+                #Creates the input string for model
                 input_str, _ = compose_instance(mode=mode, step_id=step+1, task_desc=task_description, returns_to_go=returns_to_go,
                                         curr_action=None, curr_obs=obs, inventory=info['inv'], look=info['look'], 
                                         prev_action=prev_action, prev_obs=prev_obs, objects=objects, places=places, 
@@ -375,18 +377,21 @@ def eval(args, task_num, logger):
                 prev_obs = obs 
 
                 # Get valid actions at this point
+                # Heuristic to change systems
                 if args["slow_agent"]:                    
                     force_system_2 = False 
                     force_system_1 = False 
-                    
+                    # If system 1 is stuck (no action done for 2 steps or two failed actions) switch to system 2
                     if no_action_done >= 2 or len(failed_messages) >= 2:
                         force_system_1 = False
                         force_system_2 = True            
                         logger.info("Force to do force_system_2")
+                    # If system 1 already focused on something and system 2 did not, switch to system 2
                     if not system_2_focused and system_1_focused_trial >= 1:
                         force_system_1 = False
                         force_system_2 = True            
                         logger.info("Force to do force_system_2")
+                    # If system 2 has been used for 2 steps, switch to system 1
                     if consecutive_system2 >= 2:
                         force_system_1 = True
                         force_system_2 = False
@@ -395,10 +400,11 @@ def eval(args, task_num, logger):
                     if True:
                         input_str = sanitizeStr(input_str)
                         logger.info("InputStr: " + input_str)
+                        # Invokes Swift, return top predicted actions
                         predStrs = get_model_output(args, input_str, tokenizer, lm_model, device, logger)
                     else:
                         predStrs = []
-                    
+                    # Use Sage agent
                     used_sys2, return_result = findValidActionWithSystem2(predStrs, env, task_num, task_description, info['look'],
                                                               recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
                                                               demo_data, logger, sbert_model, step, last_time_system2_steps,
@@ -420,7 +426,7 @@ def eval(args, task_num, logger):
                         consecutive_system2 += 1
                         continue 
                         
-                        
+                    # action is not None but is not valid, fallback to wait
                     if action is not None and action not in validActions:
                         logger.info(f"action '{action}' is not in validActions; ") 
                         action = "wait"
@@ -431,7 +437,7 @@ def eval(args, task_num, logger):
                     elif action is None: 
                         continue 
                 else:
-                    # Fast Agent only
+                    # Use Swift Agent only
                     input_str = sanitizeStr(input_str)
                     logger.info("InputStr: " + input_str)
                     predStrs = get_model_output(args, input_str, tokenizer, lm_model, device, logger)
@@ -439,25 +445,29 @@ def eval(args, task_num, logger):
             
  
 
-            
+            # Focus action was already executed, continue
             if action.startswith("focus on") and focus_on_done:
                 logger.info(f"You have already done great focus-on action: {useful_focus_on}. Skipping this [{action}]")
                 continue 
             
+            # Sage handled the focus on action, and we mark the flag to prevent it from trying the same subgoal
             if action.startswith("focus on") and consecutive_system2 > 0:
                 system_2_focused = True
                 
-
+            # Swift is trying to focus on, system 2 hasnt proposed focus yet
             if action.startswith("focus on") and not system_2_focused:
+                # track how many times swift tries to focus
                 system_1_focused_trial += 1
+                # only after 3 attempts or if the obeject its focusing on matches the task-relevant focus targets we allow it
                 if system_1_focused_trial >= 3 or any([clean_obj_name(tf) in clean_obj_name(action) for tf in to_focus]):
                     logger.info(f"You have never used System 2 to focus on... but system_1 has tried multiple times... so okay with [{action}]")
+                # otherwise skip action
                 else:
                     logger.info(f"You have never used System 2 to focus on... so skip [{action}]")
                     continue 
             
             
-
+            # If the action was not already executed in the previous loop, execute it
             if not executed:
                 obs, reward, done, info = env.step(action)
 
@@ -479,7 +489,7 @@ def eval(args, task_num, logger):
                 logger.info(f"\t\t Failed: [{action}] --> {obs}")
                 failed_messages.append(f"\t\t Failed action: (in {current_place}) [{action}] --> {obs}")
             
-
+            # if the focus on is useful (positive reward) we will track it ---> maybe we can use it for episodic/semantic memory just like the failure messages TO DO
             if reward > 0 and action.startswith("focus on"):
                 useful_focus_on.append(action)
                 if len(useful_focus_on) == max(focus_on_count[str(task_num)], task_description.count("focus")):
