@@ -23,6 +23,9 @@ from scienceworld.utils import infer_task
 import logging
 logger = logging.getLogger(__name__)
 
+from letta_client import Letta
+
+
 class MyScienceWorldEnv(ScienceWorldEnv):
     # it is only used for fixing the logging error --> logger.info(f"ScienceWorld server running on {port}") 
     def __init__(self, taskName=None, serverPath=None, envStepLimit=100):
@@ -131,6 +134,10 @@ def eval(args, task_num, logger):
     # plans = get_plans(args)
     gpt_version = args["gpt_version"]
     scores = []
+
+    client = Letta(base_url="http://localhost:8283")
+    logger.info(f"Connected to Letta agent: {client.agents.retrieve(agent_id='memory-agent')}")
+
 
     for variation in variations:
         if args["debug_var"] >=0 and variation != args["debug_var"]:
