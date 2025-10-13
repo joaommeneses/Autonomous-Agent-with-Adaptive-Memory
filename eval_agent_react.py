@@ -89,9 +89,13 @@ def clean(s):
 
 # Call language model
 def llm_gpt(prompt, stop=["\n"], gpt_version="gemini-2.5-flash-preview-04-17"):
-    resp = completion_with_backoff(
+    resp = completion_with_backoff_react(
                 model=gpt_version,
-                messages=[{"parts": [{"text": prompt}]}]
+                messages=[{"parts": [{"text": prompt}]}],
+                n=1, 
+                temperature=0, 
+                top_p=1,                
+                stop=stop
             )    
     return resp.candidates[0].content.parts[0].text
 
@@ -273,6 +277,28 @@ def eval(args, task_num, logger):
     logger.info("Completed.")
 
 
+from google import genai
+import os
+from tenacity import retry, stop_after_attempt, wait_random_exponential
+from dotenv import load_dotenv
+
+load_dotenv()
+# instantiate a single client with your API key (or read from ENV)
+genai_client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+
+
+@retry(wait=wait_random_exponential(min=1, max=10), stop=stop_after_attempt(10))
+def completion_with_backoff_react(*, model, messages, n=1, temperature=0, top_p=1, stop=["\n"]):
+    return genai_client.models.generate_content(
+        model=model,
+        contents=messages,                              
+        config=types.GenerateContentConfig(
+            stopSequences=stop,            
+            temperature=0.1,
+            candidateCount=n,
+            topP=top_p,
+        )
+    )
 
 def parse_args():
     parser = argparse.ArgumentParser()

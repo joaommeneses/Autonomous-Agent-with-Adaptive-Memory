@@ -1,19 +1,20 @@
 
-import argparse
 import os
 import re
+import ast
 import time
+import json
+import copy
 import torch
 import random
-import copy
-from scienceworld import ScienceWorldEnv
-import json
+import argparse
 from tqdm import trange
+from collections import defaultdict
+from scienceworld import ScienceWorldEnv
 from data_utils.data_utils import add_current_place, add_current_objects, sanitizeStr, formalize_action
 from data_utils.data_utils import compose_instance_v1, compose_instance_v1_1, compose_instance_v2, compose_instance_v3, compose_instance_v4
 from eval_utils import load_model, findValidActionNew, load_variation, get_model_output, findValidActionWithSystem2, getFilteredValidActions, sbert_search, clean_look, is_action_failed 
 from eval_utils import try_to_replace, rooms, clean_history, get_current_room, clean_obj_name, focus_on_count, rank_candidates_by_common_words, gpt_select_valid
-from collections import defaultdict
 
 
 # from scienceworld
@@ -23,8 +24,7 @@ from scienceworld.utils import infer_task
 import logging
 logger = logging.getLogger(__name__)
 
-from letta_client import Letta
-
+from letta_client import CreateBlock, Letta, MessageCreate
 
 class MyScienceWorldEnv(ScienceWorldEnv):
     # it is only used for fixing the logging error --> logger.info(f"ScienceWorld server running on {port}") 
@@ -135,9 +135,35 @@ def eval(args, task_num, logger):
     gpt_version = args["gpt_version"]
     scores = []
 
-    client = Letta(base_url="http://localhost:8283")
-    logger.info(f"Connected to Letta agent: {client.agents.retrieve(agent_id='memory-agent')}")
+    # Initialize Letta client and memory agent
+    client = Letta(base_url="https://0936-2001-8a0-57f3-d400-1951-5829-3cd4-ba4b.ngrok-free.app")
+    agent_name = "memory-agent"
 
+    # Try to get the agent, otherwise create it
+    try:
+        agents = client.agents.list()
+        logger.info(f"Available agents: {agents}")
+        mem_agent = client.agents.retrieve(agent_id="agent-0c985fd5-2b07-43c4-adba-0fb6ef6fe520")
+        if mem_agent is None:
+            raise Exception("Agent not found")
+        logger.info(f"Found Letta agent: {mem_agent}")
+    except Exception as e:
+        logger.info(f"Agent '{agent_name}' not found, creating it...")
+        # You can customize the name/description as you wish
+        mem_agent = client.agents.create(        
+        name="MemoryAgent",
+        memory_blocks=[CreateBlock(
+            value="Memory: Episodic",
+            label="episodic_memory",
+        )],
+        system=system_prompt,
+        agent_type="memgpt_agent",
+        model="openai/letta-free",
+        embedding="hugging-face/letta-free",
+        context_window_limit=1000000,
+        include_base_tools=True
+        )
+        logger.info(f"Agent created: {agent.agent_id}, Model: {agent.model}")
 
     for variation in variations:
         if args["debug_var"] >=0 and variation != args["debug_var"]:
@@ -180,6 +206,8 @@ def eval(args, task_num, logger):
         # The env has an internal step count, some actions like look around are free
         # however, the t5 model only generates the action "look around", which will result in a dead loop below
         # so the max_steps here is only used to avoid the model generating the same action forever
+        
+        # Kill Analysis Paralysis - can be tuned as needed
         max_steps = args["env_step_limit"] * 2
  
         action_buffer = []
@@ -411,12 +439,79 @@ def eval(args, task_num, logger):
                         predStrs = get_model_output(args, input_str, tokenizer, lm_model, device, logger)
                     else:
                         predStrs = []
+                    
+                    # Build retrieval prompt for Letta
+                    letta_query = (
+                        f"Retrieve the 5 most useful episodic memories from past experience that can help solve the task:\n"
+                        f"\"{task_description}\"\n\n"
+                        f"Current agent state:\n"
+                        f"- Location: {current_place}\n"
+                        f"- Inventory: {str(info['look'])}\n"                            
+                        f"- Recent actions: {str(recent_actions[-5:])}\n"
+                        f"- Recent observations: {str(recent_obs[-5:])}\n\n"
+                        f"The memories should be as relevant as possible to this situation and help in effective planning."
+                    )
+                    try:
+                        # Send the retrieval query as a user message
+                        stream = client.agents.messages.create_stream(
+                            agent_id=mem_agent.id,
+                            messages=[
+                                MessageCreate(
+                                    role="user",
+                                    content=letta_query
+                                )
+                            ]
+                        )
+
+                        episodic_memories = []
+
+                        for chunk in stream:
+                            logger.info(f"[Letta] Retrieval chunk received: {chunk}")
+
+                            # Only process actual memory retrieval result
+                            if (
+                                getattr(chunk, "name", None) == "archival_memory_search" and
+                                getattr(chunk, "message_type", None) == "tool_return_message"
+                            ):
+                                # The tool_return is a string representation of a tuple: (list of dicts, count)
+                                try:
+                                    # Safely evaluate the tool_return string to extract the Python objects
+                                    mem_list, count = ast.literal_eval(chunk.tool_return)
+                                    logger.info(f"[LETTA EM REGISTERED] Parsed {len(mem_list)} episodic memories from tool_return.")
+                                    # Only add memories not already in the current list (avoid duplicates by timestamp)
+                                    known_timestamps = {mem["timestamp"] for mem in episodic_memories}
+                                    for mem in mem_list:
+                                        if mem["timestamp"] not in known_timestamps:
+                                            episodic_memories.append(mem)
+                                            known_timestamps.add(mem["timestamp"])
+                                    # Keep only the 5 most recent
+                                    episodic_memories = sorted(episodic_memories, key=lambda m: m["timestamp"], reverse=True)[:5]
+                                except Exception as parse_err:
+                                    logger.error(f"[Letta] Failed to parse tool_return: {parse_err}")
+
+                        if not episodic_memories:
+                            logger.info("[Letta] No relevant episodic memories were found for the current query.")
+                        else:
+                            logger.info("\n[Letta] Top episodic memories for planning phase:")
+                            for i, mem in enumerate(episodic_memories, 1):
+                                logger.info(f"Memory {i}: {mem['content']}\n")
+
+                        client.agents.messages.reset(agent_id=mem_agent.id, add_default_initial_messages=True)
+                        logger.info(f"[Letta] Message context reset for agent {mem_agent.id}.")
+
+                    except Exception as e:
+                        logger.error(f"[Letta] Retrieval failed: {e}")
                     # Use Sage agent
-                    used_sys2, return_result = findValidActionWithSystem2(predStrs, env, task_num, task_description, info['look'],
-                                                              recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
-                                                              demo_data, logger, sbert_model, step, last_time_system2_steps,
-                                                              useful_focus_on, focus_on_done, force_system_1, force_system_2, 
-                                                              gpt_version, llm=llm)  
+                    use_memory_planning = args.get("use_memory_planning", True)
+                    used_sys2, return_result = findValidActionWithSystem2(
+                        predStrs, env, task_num, task_description, info['look'],
+                        recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
+                        demo_data, logger, sbert_model, step, last_time_system2_steps,
+                        useful_focus_on, focus_on_done, force_system_1, force_system_2,
+                        gpt_version, llm=llm,
+                        episodic_memories=episodic_memories if 'episodic_memories' in locals() else None,
+                        use_memory_planning=use_memory_planning
+                    )  
                     if not used_sys2:
                         action = return_result
                         consecutive_system2 = 0
@@ -491,7 +586,79 @@ def eval(args, task_num, logger):
             recent_actions.append(action) 
             recent_obs.append(obs)
             recent_locs.append(current_place)
+            if reward > 0:
+                # Ensure all are stringified for logging and storage
+                inventory_str = str(env.inventory())
+                look_str = str(info["look"])
+                recent_actions_str = str(recent_actions[-5:])  # last 5 actions for context
+                recent_obs_str = str(recent_obs[-5:])
+                episode_data = (
+                    f"While working on the task: \"{task_description}\" at {current_place},\n"
+                    f"the action '{action}' caused '{obs}'.\n"
+                    f"Inventory: {inventory_str}\n"
+                    f"Location info: {look_str}\n"
+                    f"Recent actions: {recent_actions_str}\n"
+                    f"Recent obs: {recent_obs_str}\n"
+                    f"This resulted in a reward: {reward}, updating the score: {last_score} -> {score}.\n"
+                    "Marked as SUCCESS."
+                )
+                logger.info(f"[Letta][DEBUG] Sending SUCCESS episodic memory to agent:\n{episode_data}")                
 
+                try:
+                    stream = client.agents.messages.create_stream(
+                        agent_id=mem_agent.id,
+                        messages=[
+                            MessageCreate(
+                                role="user",
+                                content=episode_data
+                            )
+                        ]                        
+                    )
+                     # Optionally, collect and log the full response (mainly for debugging)
+                    
+                    for chunk in stream:
+                        logger.info(f"[Letta] Episodic memory stored (streaming chunk reply): {chunk}")    
+                    # Reset the message context for the agent to avoid memory overflow
+                    client.agents.messages.reset(agent_id=mem_agent.id, add_default_initial_messages=True)
+                    logger.info(f"[Letta] Message context reset for agent {mem_agent.id}.")                   
+                    
+                    reply = "".join([chunk.choices[0].delta.content or "" for chunk in stream])
+                    # logger.info(f"[Letta] Episodic memory stored: {episode_data}")                
+                except Exception as e:
+                    logger.error(f"[Letta] Failed to store episodic memory: {str(e)}")
+            # else:
+            #     # Only store FAILURE episodic memory when the action *just* failed (avoid redundant spam, e.g. use your own custom logic if needed)
+            #     episode_data = (
+            #         f"While working on the task: \"{task_description}\" at {current_place}, "
+            #         f"the action '{action}' caused '{obs}'. "
+            #         f"No reward was received. Score: {score}. "
+            #         "Marked as FAILURE."
+            #     )
+            #     logger.info(f"[Letta][DEBUG] Sending FAILURE episodic memory to agent:\n{episode_data}")
+
+            #     try:
+            #         stream = client.agents.messages.create_stream(
+            #             agent_id=mem_agent.id,
+            #             messages=[
+            #                 MessageCreate(
+            #                     role="user",
+            #                     content=episode_data
+            #                 )
+            #             ]                        
+            #         )
+            #          # Optionally, collect and log the full response (mainly for debugging)
+                    
+            #         for chunk in stream:
+            #             logger.info(f"[Letta] Episodic memory stored (streaming chunk reply): {chunk}")
+            #         # Reset the message context for the agent to avoid memory overflow
+            #         client.agents.messages.reset(agent_id=mem_agent.id, add_default_initial_messages=True)
+            #         logger.info(f"[Letta] Message context reset for agent {mem_agent.id}.")         
+
+            #         reply = "".join([chunk.choices[0].delta.content or "" for chunk in stream])
+            #         # logger.info(f"[Letta] Episodic memory stored: {episode_data}")
+            #     except Exception as e:
+            #         logger.error(f"[Letta] Failed to store episodic memory: {str(e)}")
+            
             if is_action_failed(obs):
                 logger.info(f"\t\t Failed: [{action}] --> {obs}")
                 failed_messages.append(f"\t\t Failed action: (in {current_place}) [{action}] --> {obs}")
@@ -591,6 +758,7 @@ def parse_args():
     parser.add_argument("--local_llm", default="none", type=str)  
     parser.add_argument("--demo_file", default="data_utils/demos.json", type=str)
     parser.add_argument("--debug_var", type=int, default=93)
+    parser.add_argument("--use_memory_planning", action="store_true", default=True)
     args = parser.parse_args()
     params = vars(args)
     return params

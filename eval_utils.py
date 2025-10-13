@@ -140,7 +140,8 @@ def load_variation(env, args, task_num, logger):
     elif (args["set"] == "test"):               
         variations = list(env.getVariationsTest())
         if len(variations) > 5:
-            variations = variations[:5]
+            # variations = variations[:5]
+            variations = variations[:2] # ===== TESTING PURPOSES
     elif (args["set"] == "dev"):
         variations = list(env.getVariationsDev()) 
         variations = variations[:3]
@@ -426,7 +427,8 @@ def findValidActionWithSystem2(
     recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
     demo_data, logger, sbert_model, step, last_time_system2_steps,
     useful_focus_on, focus_on_done, force_system_1, force_system_2,
-    gpt_version="gemini-2.5-flash-preview-04-17", llm=None
+    gpt_version="gemini-2.5-flash-preview-04-17", llm=None,
+    episodic_memories=None, use_memory_planning=True
 ):
     inventory = env.inventory()
     validActions = getFilteredValidActions(env, look, task_id=task_id, task_desc=task_description)
@@ -487,6 +489,16 @@ def findValidActionWithSystem2(
             failed_messages, look, inventory, fast_action,
             version="full"
         )
+        # Memory-based augmentation (prepend Past Episodes)
+        if use_memory_planning and episodic_memories:
+            try:
+                pe_block = format_past_episodes(episodic_memories)
+            except Exception:
+                pe_block = ""
+            if pe_block:
+                prompt_to_plan = pe_block + "\n\n" + prompt_to_plan
+                logger.debug("===== AUGMENTED PROMPT TO PLAN (with Past Episodes) =====\n" + prompt_to_plan)
+                logger.debug(f"Using {min(5, len(episodic_memories))} past episodes in planning.")
         # fallback to lite if too long
         if len(enc.encode(prompt_to_plan)) >= 8000:
             prompt_to_plan = compose_prompt_to_plan(
@@ -770,6 +782,103 @@ def compose_prompt_to_plan(demos, useful_focus_on, task_desc, recent_actions, re
     prompt_to_plan.append("Please do not try to look for books or computers to look up information. You will need to use your own commonsense knowledge to make decisions (e.g., determining properties of objects and animals).")
     prompt_to_plan.append("Please read the task description carefully, and think step by step to answer these questions one by one. Please be concise. Thank you very much.")
     return '\n'.join(prompt_to_plan)
+
+
+# ================= Adaptive Memory: Past Episodes Utilities =================
+def parse_episode(content):
+    """Parse a SUCCESS-style episodic memory string.
+
+    Returns dict with keys: room, action, observation, reward_delta, task.
+    On failure, returns None.
+    """
+    if not content or not isinstance(content, str):
+        return None
+    text = content.strip()
+    try:
+        # Task
+        task_match = re.search(r'While\s+working\s+on\s+the\s+task:\s*"([\s\S]*?)"', text, re.IGNORECASE)
+        task = task_match.group(1).strip() if task_match else None
+
+        # Room/location (" at <room>," pattern)
+        room_match = re.search(r'\bat\s+([A-Za-z\s]+?),\s*\n?', text, re.IGNORECASE)
+        room = room_match.group(1).strip().lower() if room_match else None
+
+        # Action and Observation (the action 'X' caused 'Y'.)
+        action_match = re.search(r"the\s+action\s+'([^']+)'\s+caused\s+'([^']+)'", text, re.IGNORECASE)
+        action = action_match.group(1).strip() if action_match else None
+        observation = action_match.group(2).strip() if action_match else None
+
+        # Reward delta (This resulted in a reward: <num>)
+        reward_match = re.search(r'This\s+resulted\s+in\s+a\s+reward:\s*([-+]?\d+(?:\.\d+)?)', text, re.IGNORECASE)
+        reward_delta = float(reward_match.group(1)) if reward_match else None
+
+        if not (room and action and observation and task is not None and reward_delta is not None):
+            return None
+
+        return {
+            "room": room,
+            "action": action,
+            "observation": observation,
+            "reward_delta": reward_delta,
+            "task": task,
+        }
+    except Exception:
+        return None
+
+
+def format_past_episodes(mem_list):
+    """Format a compact Past Episodes block from episodic memories.
+
+    mem_list: list of dicts with at least {timestamp, content}
+    Returns a string or empty string if nothing to show.
+    """
+    if not mem_list:
+        return ""
+
+    parsed = []
+    for m in mem_list[:10]:  # attempt parse beyond 5 in case of skips
+        content = m.get("content", "")
+        info = parse_episode(content)
+        if not info:
+            continue
+        parsed.append(info)
+        if len(parsed) >= 5:
+            break
+
+    if not parsed:
+        return ""
+
+    lines = ["Past Episodes (most related first, max 5)"]
+
+    # Build bullets
+    for p in parsed:
+        room = p["room"]
+        action = p["action"]
+        observation = p["observation"][:120]
+        rd = p["reward_delta"]
+        rd_str = ("+" if rd is not None and rd > 0 else "") + (f"{int(rd)}" if rd is not None and float(rd).is_integer() else f"{rd}")
+        # shorten task
+        task = p["task"].replace("\n", " ").strip()
+        if len(task) > 80:
+            task = task[:77] + "..."
+        bullet = f"• [{room}] — [{action}] → [{observation}] (Δscore: {rd_str}; task: \"{task}\")"
+        lines.append(bullet)
+
+    # Optional hint if same action in same room appears multiple times
+    freq = {}
+    for p in parsed:
+        key = (p["room"], p["action"])
+        freq[key] = freq.get(key, 0) + 1
+    common = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+    if common and common[0][1] >= 2:
+        (room, action), _ = common[0]
+        lines.append(f"Hint: actions that helped in [{room}]: [{action}].")
+
+    block = "\n".join(lines)
+    # Hard cap length to ~1200 chars
+    if len(block) > 1200:
+        block = block[:1197] + "..."
+    return block
 
 def clean_history(recent_actions, recent_obs, recent_score, recent_reward, recent_locs):
     assert len(recent_actions) == len(recent_obs) == len(recent_score) == len(recent_reward) == len(recent_locs)
