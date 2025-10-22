@@ -21,13 +21,14 @@ def _now_ts() -> int:
     return int(time.time())
 
 
-def write_success(client: AMMLettaClient, rec: MemoryRecord) -> str:
+def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None) -> str:
     """
     Write a SUCCESS memory record.
     
     Args:
         client: AMM Letta client
         rec: Memory record (type will be set to episodic_success)
+        tag: Optional tag for the success type (e.g., "terminal", "product-made", "reward-validated")
         
     Returns:
         Memory ID
@@ -36,19 +37,24 @@ def write_success(client: AMMLettaClient, rec: MemoryRecord) -> str:
     rec.meta.setdefault("created_ts", _now_ts())
     rec.meta["last_seen_ts"] = rec.meta["created_ts"]
     
-    logger.info(f"[AMM Writer] Writing SUCCESS memory: {rec.goal_signature}")
+    # Add tag to meta if provided
+    if tag:
+        rec.meta["success_tag"] = tag
+    
+    logger.info(f"[AMM Writer] Writing SUCCESS memory ({tag or 'default'}): {rec.goal_signature}")
     
     # TODO: Add de-dup hook (amm/dedup.py) in future phases
     return client.add_tagged(rec.to_dict(), "episodic_success")
 
 
-def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord) -> str:
+def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None) -> str:
     """
     Write a NEARMISS memory record.
     
     Args:
         client: AMM Letta client
         rec: Memory record (type will be set to episodic_nearmiss)
+        tag: Optional tag for the nearmiss type (e.g., "progress")
         
     Returns:
         Memory ID
@@ -57,18 +63,23 @@ def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord) -> str:
     rec.meta.setdefault("created_ts", _now_ts())
     rec.meta["last_seen_ts"] = rec.meta["created_ts"]
     
-    logger.info(f"[AMM Writer] Writing NEARMISS memory: {rec.goal_signature}")
+    # Add tag to meta if provided
+    if tag:
+        rec.meta["nearmiss_tag"] = tag
+    
+    logger.info(f"[AMM Writer] Writing NEARMISS memory ({tag or 'default'}): {rec.goal_signature}")
     
     return client.add_tagged(rec.to_dict(), "episodic_nearmiss")
 
 
-def write_avoidance(client: AMMLettaClient, rec: MemoryRecord) -> str:
+def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None) -> str:
     """
     Write an AVOIDANCE memory record.
     
     Args:
         client: AMM Letta client
         rec: Memory record (type will be set to avoidance)
+        tag: Optional tag for the avoidance type (e.g., "shaping-decoy", "exec-invalid")
         
     Returns:
         Memory ID
@@ -80,7 +91,11 @@ def write_avoidance(client: AMMLettaClient, rec: MemoryRecord) -> str:
     # Add TTL for avoidance memories (50 episodes as per spec)
     rec.meta["ttl_steps"] = 50
     
-    logger.info(f"[AMM Writer] Writing AVOIDANCE memory: {rec.goal_signature}")
+    # Add tag to meta if provided
+    if tag:
+        rec.meta["avoidance_tag"] = tag
+    
+    logger.info(f"[AMM Writer] Writing AVOIDANCE memory ({tag or 'default'}): {rec.goal_signature}")
     
     return client.add_tagged(rec.to_dict(), "avoidance")
 
