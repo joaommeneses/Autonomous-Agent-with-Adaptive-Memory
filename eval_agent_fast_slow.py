@@ -135,7 +135,24 @@ def eval(args, task_num, logger):
     gpt_version = args["gpt_version"]
     scores = []
 
-    # Initialize Letta client and memory agent
+    # === AMM INIT ===
+    from amm.client_letta import AMMLettaClient, LettaConfig
+    from amm.working_memory import WorkingMemory
+    from amm.writer import write_success, write_nearmiss, write_avoidance, create_memory_record
+    from amm.schema import MemoryRecord
+    from amm.config import DEFAULT_CONFIG
+
+    # Initialize AMM client and working memory
+    amm_config = LettaConfig(
+        agent_name="MemoryAgent",
+        base_url="https://0936-2001-8a0-57f3-d400-1951-5829-3cd4-ba4b.ngrok-free.app"
+    )
+    amm_client = AMMLettaClient(amm_config)
+    wm = WorkingMemory()
+    logger.info("[AMM] Adaptive Memory Module initialized")
+    # =================
+
+    # Initialize Letta client and memory agent (legacy - will be replaced by AMM)
     client = Letta(base_url="https://0936-2001-8a0-57f3-d400-1951-5829-3cd4-ba4b.ngrok-free.app")
     agent_name = "memory-agent"
 
@@ -173,6 +190,12 @@ def eval(args, task_num, logger):
         env.load(taskName, variation, args["simplification_str"], generateGoldPath=True)
         task_description = env.taskdescription()[18:]
         logger.info(f"task_description = {task_description}")
+        
+        # === AMM HOOK: EPISODE RESET ===
+        wm.reset()
+        wm.pending_subgoal = task_description
+        logger.info(f"[AMM] Working memory reset for new episode: {task_description[:50]}...")
+        # ================================
         # task_description = env.taskdescription()  
         recent_actions = ["look around"]
         recent_obs = ["N/A"]
@@ -586,6 +609,96 @@ def eval(args, task_num, logger):
             recent_actions.append(action) 
             recent_obs.append(obs)
             recent_locs.append(current_place)
+            
+            # === AMM HOOK: POST-STEP WRITE ===
+            try:
+                # Update working memory
+                wm.record_action(action)
+                wm.update_room(current_place)
+                wm.update_inventory(env.inventory())
+                
+                # Build goal signature
+                goal_sig = task_description
+                
+                # Create memory record
+                rec = create_memory_record(
+                    goal_signature=goal_sig,
+                    action_text=action,
+                    obs_text=obs
+                )
+
+                # Normalize
+                a_norm = (action or "").strip().lower()
+                o_norm = (obs or "").strip().lower()
+                info_msg = ""
+                if info and isinstance(info, dict):
+                    info_msg = str(info.get("message", "")).lower()
+
+                # Config
+                R_TERMINAL   = DEFAULT_CONFIG.R_TERMINAL
+                R_MILESTONE  = DEFAULT_CONFIG.R_MILESTONE
+                SHAPING      = DEFAULT_CONFIG.SHAPING_ACTIONS
+                PRODUCE_CUES = DEFAULT_CONFIG.PRODUCE_CUES
+                PROGRESS_CUES= DEFAULT_CONFIG.PROGRESS_CUES
+                FAILURE_CUES = DEFAULT_CONFIG.FAILURE_CUES
+
+                def starts_with_any(s: str, prefixes):
+                    return any(s.startswith(p) for p in prefixes)
+
+                def contains_any(s: str, toks):
+                    return any(t in s for t in toks)
+
+                wrote = False  # ensure at most one write per step
+
+                # --- SUCCESS: terminal focus ---
+                if ("you focus on" in o_norm):
+                    write_success(amm_client, rec, tag="terminal")
+                    wm.reset_cycles_without_progress()
+                    wrote = True
+
+                # --- SUCCESS: product made (mix -> produce/created/formed) ---
+                # TODO: add more produce cues (mix specific FOR NOW)
+                elif ("mix" in o_norm) and contains_any(o_norm, PRODUCE_CUES):
+                    write_success(amm_client, rec, tag="product-made")
+                    wm.reset_cycles_without_progress()
+                    wrote = True
+
+                # --- SUCCESS: large reward, non-shaping ---
+                elif (reward is not None) and (reward >= R_TERMINAL) and not starts_with_any(a_norm, SHAPING):
+                    write_success(amm_client, rec, tag="reward-validated")
+                    wm.reset_cycles_without_progress()
+                    wrote = True
+
+                # --- NEARMISS: progress cues with milestone or zero reward (non-shaping) ---
+                elif not wrote and not starts_with_any(a_norm, SHAPING):
+                    if contains_any(o_norm, PROGRESS_CUES):
+                        if (reward is not None) and (reward >= R_MILESTONE or reward == 0.0):
+                            write_nearmiss(amm_client, rec, tag="progress")
+                            wm.reset_cycles_without_progress()
+                            wrote = True
+
+                # --- AVOIDANCE: shaping with reward (deceptive) ---
+                if not wrote and starts_with_any(a_norm, SHAPING) and (reward is not None) and (reward > 0):
+                    write_avoidance(amm_client, rec, tag="shaping-decoy")
+                    wm.increment_cycles_without_progress()
+                    wrote = True
+
+                # --- AVOIDANCE: explicit failure cues ---
+                if not wrote and info_msg:
+                    if contains_any(info_msg, FAILURE_CUES):
+                        write_avoidance(amm_client, rec, tag="exec-invalid")
+                        wm.increment_cycles_without_progress()
+                        wrote = True
+
+                # --- default: no memory ---
+                if not wrote:
+                    # If we didn't write success/nearmiss, count this as no progress
+                    wm.increment_cycles_without_progress()
+
+            except Exception as e:
+                logger.error(f"[AMM] Memory writing failed: {e}")
+            # ===============================
+            
             if reward > 0:
                 # Ensure all are stringified for logging and storage
                 inventory_str = str(env.inventory())
