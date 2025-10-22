@@ -13,7 +13,7 @@ from .schema import MemoryRecord, MemoryType
 from .working_memory import WorkingMemory
 from .client_letta import AMMLettaClient, LettaConfig
 from .writer import write_success, write_nearmiss, write_avoidance
-from .config import AMMConfig
+from .config import AMMConfig, DEFAULT_CONFIG
 
 __version__ = "0.1.0"
 __all__ = [
@@ -25,5 +25,6 @@ __all__ = [
     "write_success",
     "write_nearmiss", 
     "write_avoidance",
-    "AMMConfig"
+    "AMMConfig",
+    "DEFAULT_CONFIG"
 ]
