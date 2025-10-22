@@ -17,7 +17,21 @@ class AMMConfig:
     agent_name: str = "MemoryAgent"
     base_url: str = "https://0936-2001-8a0-57f3-d400-1951-5829-3cd4-ba4b.ngrok-free.app"
     
-    # Memory writing thresholds
+    # Reward thresholds (normalized)
+    R_TERMINAL: float = 0.5         # normalized reward ~ +50 or more
+    R_MILESTONE: float = 0.08       # normalized reward ~ +8 or more (catches +10, +20)
+    
+    # Action classification
+    SHAPING_ACTIONS: set = None     # Actions that are considered shaping (wait, wait1)
+    
+    # Success and progress cues (conservative lists)
+    PRODUCE_CUES: List[str] = None  # Used with mix context
+    PROGRESS_CUES: List[str] = None # General progress indicators
+    
+    # Avoidance error substrings (keep short)
+    FAILURE_CUES: List[str] = None
+    
+    # Legacy memory writing thresholds (kept for compatibility)
     success_reward_threshold: float = 0.0  # Write SUCCESS if reward > this
     nearmiss_keywords: List[str] = None  # Keywords that indicate credible progress
     avoidance_keywords: List[str] = None  # Keywords that indicate invalid/blocked actions
@@ -46,6 +60,19 @@ class AMMConfig:
     
     def __post_init__(self):
         """Set default keyword lists if not provided"""
+        if self.SHAPING_ACTIONS is None:
+            self.SHAPING_ACTIONS = {"wait", "wait1"}
+        
+        if self.PRODUCE_CUES is None:
+            self.PRODUCE_CUES = ["produce", "created", "create", "formed", "form"]
+        
+        if self.PROGRESS_CUES is None:
+            self.PROGRESS_CUES = ["pour", "mixed", "mix", "opened", "open", "combined", "combine"]
+        
+        if self.FAILURE_CUES is None:
+            self.FAILURE_CUES = ["can't", "cannot", "not possible", "invalid", "do not have", "won't work"]
+        
+        # Legacy keyword lists (kept for compatibility)
         if self.nearmiss_keywords is None:
             self.nearmiss_keywords = [
                 "opened", "unlocked", "lit", "attached", "connected", 
