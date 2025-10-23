@@ -18,8 +18,8 @@ class AMMConfig:
     base_url: str = "https://0936-2001-8a0-57f3-d400-1951-5829-3cd4-ba4b.ngrok-free.app"
     
     # Reward thresholds (normalized)
-    R_TERMINAL: float = 0.5         # normalized reward ~ +50 or more
-    R_MILESTONE: float = 0.08       # normalized reward ~ +8 or more (catches +10, +20)
+    R_TERMINAL: float = 30.0         # normalized reward ~ +50 or more
+    R_MILESTONE: float = 8.0       # normalized reward ~ +8 or more (catches +10, +20)
     
     # Action classification
     SHAPING_ACTIONS: set = None     # Actions that are considered shaping (wait, wait1)
