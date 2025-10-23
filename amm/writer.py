@@ -21,7 +21,7 @@ def _now_ts() -> int:
     return int(time.time())
 
 
-def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None) -> str:
+def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, meta: dict = None) -> str:
     """
     Write a SUCCESS memory record.
     
@@ -29,6 +29,7 @@ def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None) ->
         client: AMM Letta client
         rec: Memory record (type will be set to episodic_success)
         tag: Optional tag for the success type (e.g., "terminal", "product-made", "reward-validated")
+        meta: Optional additional metadata to merge into the record's meta
         
     Returns:
         Memory ID
@@ -40,6 +41,10 @@ def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None) ->
     # Add tag to meta if provided
     if tag:
         rec.meta["success_tag"] = tag
+    
+    # Merge additional meta if provided
+    if meta:
+        rec.meta.update(meta)
     
     logger.info(f"[AMM Writer] Writing SUCCESS memory ({tag or 'default'}): {rec.goal_signature}")
     
