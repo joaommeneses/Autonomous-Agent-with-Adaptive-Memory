@@ -554,29 +554,60 @@ def eval(args, task_num, logger):
                 def contains_any(s: str, toks):
                     return any(t in s for t in toks)
 
+                # Helper: extract the focused object from action/obs
+                def extract_focus_target(action_text: str, obs_text: str) -> str:
+                    # Prefer action when available
+                    if action_text and action_text.lower().startswith("focus on"):
+                        return clean_obj_name(action_text.lower().replace("focus on", "", 1).strip())
+                    # Fallback to observation pattern: "you focus on X."
+                    marker = "you focus on"
+                    o = (obs_text or "").lower()
+                    if marker in o:
+                        frag = o.split(marker, 1)[1].strip()
+                        # cut at sentence end if present
+                        if "." in frag:
+                            frag = frag.split(".", 1)[0].strip()
+                        return clean_obj_name(frag)
+                    return ""
+
+                def goal_focus_match(focus_obj: str, goal_targets: list) -> bool:
+                    if not focus_obj or not goal_targets:
+                        return False
+                    f = clean_obj_name((focus_obj or "").lower())
+                    for t in goal_targets:
+                        tt = clean_obj_name((t or "").lower())
+                        # bidirectional substring match to be tolerant of determiners and adjectives
+                        if (tt and f) and (tt in f or f in tt):
+                            return True
+                    return False
+
                 wrote = False  # ensure at most one write per step
 
-                # --- SUCCESS: terminal focus ---
-                if ("you focus on" in o_norm):
-                    write_success(amm_client, rec, tag="terminal")
-                    wm.reset_cycles_without_progress()
-                    wrote = True
+                # --- SUCCESS: terminal focus (strict & goal-aligned) ---
+                if ("you focus on" in o_norm) or a_norm.startswith("focus on"):
+                    focus_obj = extract_focus_target(action, obs)
+                    if goal_focus_match(focus_obj, to_focus) and ((reward is not None and reward >= R_TERMINAL) or done):
+                        write_success(amm_client, rec, tag="terminal_focus", meta={"focus_obj": focus_obj, "done": done, "reward": reward})
+                        wm.reset_cycles_without_progress()
+                        wrote = True
 
-                # --- SUCCESS: product made (mix -> produce/created/formed) ---
-                # TODO: add more produce cues (mix specific FOR NOW)
-                elif ("mix" in o_norm) and contains_any(o_norm, PRODUCE_CUES):
-                    write_success(amm_client, rec, tag="product-made")
-                    wm.reset_cycles_without_progress()
-                    wrote = True
+                # --- SUCCESS: product made (DISABLED for now; guard by config flag) ---
+                ENABLE_PRODUCE_SUCCESS = getattr(DEFAULT_CONFIG, "ENABLE_PRODUCE_SUCCESS", False)
+                if (not wrote) and ENABLE_PRODUCE_SUCCESS:
+                    # Example placeholder; when re-enabled, broaden beyond 'mix' and require reward >= R_MILESTONE
+                    if contains_any(o_norm, PRODUCE_CUES) and (reward is not None and reward >= R_MILESTONE):
+                        write_success(amm_client, rec, tag="product_made")
+                        wm.reset_cycles_without_progress()
+                        wrote = True
 
-                # --- SUCCESS: large reward, non-shaping ---
-                elif (reward is not None) and (reward >= R_TERMINAL) and not starts_with_any(a_norm, SHAPING):
-                    write_success(amm_client, rec, tag="reward-validated")
+                # --- SUCCESS: milestone (large positive reward, non-shaping) ---
+                if (not wrote) and (reward is not None) and (reward >= R_MILESTONE) and not starts_with_any(a_norm, SHAPING):
+                    write_success(amm_client, rec, tag="milestone")
                     wm.reset_cycles_without_progress()
                     wrote = True
 
                 # --- NEARMISS: progress cues with milestone or zero reward (non-shaping) ---
-                elif not wrote and not starts_with_any(a_norm, SHAPING):
+                if not wrote and not starts_with_any(a_norm, SHAPING):
                     if contains_any(o_norm, PROGRESS_CUES):
                         if (reward is not None) and (reward >= R_MILESTONE or reward == 0.0):
                             write_nearmiss(amm_client, rec, tag="progress")
