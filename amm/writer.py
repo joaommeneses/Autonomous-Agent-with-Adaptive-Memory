@@ -52,7 +52,7 @@ def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, me
     return client.add_tagged(rec.to_dict(), "episodic_success")
 
 
-def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None) -> str:
+def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, meta: dict = None) -> str:
     """
     Write a NEARMISS memory record.
     
@@ -60,6 +60,7 @@ def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None) -
         client: AMM Letta client
         rec: Memory record (type will be set to episodic_nearmiss)
         tag: Optional tag for the nearmiss type (e.g., "progress")
+        meta: Optional additional metadata to merge into the record's meta
         
     Returns:
         Memory ID
@@ -72,12 +73,16 @@ def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None) -
     if tag:
         rec.meta["nearmiss_tag"] = tag
     
+    # Merge additional meta if provided
+    if meta:
+        rec.meta.update(meta)
+    
     logger.info(f"[AMM Writer] Writing NEARMISS memory ({tag or 'default'}): {rec.goal_signature}")
     
     return client.add_tagged(rec.to_dict(), "episodic_nearmiss")
 
 
-def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None) -> str:
+def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, meta: dict = None) -> str:
     """
     Write an AVOIDANCE memory record.
     
@@ -85,6 +90,7 @@ def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None) 
         client: AMM Letta client
         rec: Memory record (type will be set to avoidance)
         tag: Optional tag for the avoidance type (e.g., "shaping-decoy", "exec-invalid")
+        meta: Optional additional metadata to merge into the record's meta
         
     Returns:
         Memory ID
@@ -99,6 +105,10 @@ def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None) 
     # Add tag to meta if provided
     if tag:
         rec.meta["avoidance_tag"] = tag
+    
+    # Merge additional meta if provided
+    if meta:
+        rec.meta.update(meta)
     
     logger.info(f"[AMM Writer] Writing AVOIDANCE memory ({tag or 'default'}): {rec.goal_signature}")
     
