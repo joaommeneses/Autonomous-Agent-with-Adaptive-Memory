@@ -606,30 +606,27 @@ def eval(args, task_num, logger):
                     wm.reset_cycles_without_progress()
                     wrote = True
 
-                # --- NEARMISS: progress cues with milestone or zero reward (non-shaping) ---
-                if not wrote and not starts_with_any(a_norm, SHAPING):
-                    if contains_any(o_norm, PROGRESS_CUES):
-                        if (reward is not None) and (reward >= R_MILESTONE or reward == 0.0):
-                            write_nearmiss(amm_client, rec, tag="progress")
-                            wm.reset_cycles_without_progress()
-                            wrote = True
-
-                # --- AVOIDANCE: shaping with reward (deceptive) ---
-                if not wrote and starts_with_any(a_norm, SHAPING) and (reward is not None) and (reward > 0):
-                    write_avoidance(amm_client, rec, tag="shaping-decoy")
-                    wm.increment_cycles_without_progress()
+                # --- NEARMISS: positive step (non-shaping, small positive reward) ---
+                if (not wrote) and (reward is not None) and (reward > 0) and (reward < R_MILESTONE) and (not starts_with_any(a_norm, SHAPING)):
+                    write_nearmiss(amm_client, rec, tag="positive-step", meta={"reward": reward})
+                    wm.reset_cycles_without_progress()
                     wrote = True
 
-                # --- AVOIDANCE: explicit failure cues ---
-                if not wrote and info_msg:
-                    if contains_any(info_msg, FAILURE_CUES):
-                        write_avoidance(amm_client, rec, tag="exec-invalid")
-                        wm.increment_cycles_without_progress()
-                        wrote = True
+                # --- NEARMISS: timed progress (shaping step produced reward due to delayed effects) ---
+                if (not wrote) and starts_with_any(a_norm, SHAPING) and (reward is not None) and (reward > 0):
+                    # e.g., 'wait' after starting heating/boiling; reward is realized on the shaping step
+                    write_nearmiss(amm_client, rec, tag="timed-progress", meta={"reward": reward, "shaping_action": a_norm})
+                    wm.reset_cycles_without_progress()
+                    wrote = True
+
+                # --- AVOIDANCE: explicit failure cues (execution invalid/blocked/etc.) ---
+                if (not wrote) and info_msg and contains_any(info_msg, FAILURE_CUES):
+                    write_avoidance(amm_client, rec, tag="exec-invalid")
+                    wm.increment_cycles_without_progress()
+                    wrote = True                
 
                 # --- default: no memory ---
                 if not wrote:
-                    # If we didn't write success/nearmiss, count this as no progress
                     wm.increment_cycles_without_progress()
 
             except Exception as e:
