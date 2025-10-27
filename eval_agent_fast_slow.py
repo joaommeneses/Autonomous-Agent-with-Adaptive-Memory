@@ -592,13 +592,13 @@ def eval(args, task_num, logger):
                         wrote = True
 
                 # --- SUCCESS: product made (DISABLED for now; guard by config flag) ---
-                ENABLE_PRODUCE_SUCCESS = getattr(DEFAULT_CONFIG, "ENABLE_PRODUCE_SUCCESS", False)
-                if (not wrote) and ENABLE_PRODUCE_SUCCESS:
-                    # Example placeholder; when re-enabled, broaden beyond 'mix' and require reward >= R_MILESTONE
-                    if contains_any(o_norm, PRODUCE_CUES) and (reward is not None and reward >= R_MILESTONE):
-                        write_success(amm_client, rec, tag="product_made")
-                        wm.reset_cycles_without_progress()
-                        wrote = True
+                # ENABLE_PRODUCE_SUCCESS = getattr(DEFAULT_CONFIG, "ENABLE_PRODUCE_SUCCESS", False)
+                # if (not wrote) and ENABLE_PRODUCE_SUCCESS:
+                #     # Example placeholder; when re-enabled, broaden beyond 'mix' and require reward >= R_MILESTONE
+                #     if contains_any(o_norm, PRODUCE_CUES) and (reward is not None and reward >= R_MILESTONE):
+                #         write_success(amm_client, rec, tag="product_made")
+                #         wm.reset_cycles_without_progress()
+                #         wrote = True
 
                 # --- SUCCESS: milestone (large positive reward, non-shaping) ---
                 if (not wrote) and (reward is not None) and (reward >= R_MILESTONE) and not starts_with_any(a_norm, SHAPING):
@@ -612,12 +612,40 @@ def eval(args, task_num, logger):
                     wm.reset_cycles_without_progress()
                     wrote = True
 
-                # --- NEARMISS: timed progress (shaping step produced reward due to delayed effects) ---
+                # --- SUCCESS/NEARMISS for time-delayed rewards on shaping actions ---
+                # If a shaping step (e.g., 'wait') yields reward, classify by completion or magnitude.
                 if (not wrote) and starts_with_any(a_norm, SHAPING) and (reward is not None) and (reward > 0):
-                    # e.g., 'wait' after starting heating/boiling; reward is realized on the shaping step
-                    write_nearmiss(amm_client, rec, tag="timed-progress", meta={"reward": reward, "shaping_action": a_norm})
-                    wm.reset_cycles_without_progress()
-                    wrote = True
+                    if done or (reward >= R_TERMINAL):
+                        # Terminal completion or large terminal-level reward happened on a shaping step
+                        write_success(
+                            amm_client,
+                            rec,
+                            tag="terminal-delayed",
+                            meta={"reward": reward, "shaping_action": a_norm, "done": bool(done)}
+                        )
+                        wm.reset_cycles_without_progress()
+                        wrote = True
+                    elif reward >= R_MILESTONE:
+                        # Significant milestone realized via shaping
+                        write_success(
+                            amm_client,
+                            rec,
+                            tag="milestone-delayed",
+                            meta={"reward": reward, "shaping_action": a_norm}
+                        )
+                        wm.reset_cycles_without_progress()
+                        wrote = True
+                    else:
+                        # Small incremental gain realized via shaping
+                        write_nearmiss(
+                            amm_client,
+                            rec,
+                            tag="timed-progress",
+                            meta={"reward": reward, "shaping_action": a_norm}
+                        )
+                        wm.reset_cycles_without_progress()
+                        wrote = True
+
 
                 # --- AVOIDANCE: explicit failure cues (execution invalid/blocked/etc.) ---
                 if (not wrote) and info_msg and contains_any(info_msg, FAILURE_CUES):
