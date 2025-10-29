@@ -21,6 +21,30 @@ def _now_ts() -> int:
     return int(time.time())
 
 
+def format_episodic_memory_entry(goal: str, action: str, observation: str, meta: dict) -> str:
+    """
+    Format an episodic memory entry in a human-readable format.
+    
+    Args:
+        goal: Task or goal description
+        action: Action that was executed
+        observation: Observation received
+        meta: Metadata dict with context (inventory, room, rewards, etc.)
+        
+    Returns:
+        Formatted memory string
+    """
+    return (
+        f"While working on the task: \"{goal}\",\n"
+        f"the action '{action}' caused: '{observation}'.\n"
+        f"Inventory: {meta.get('inventory_text', '')}\n"
+        f"Location: {meta.get('room', '')}\n"
+        f"Recent actions: {meta.get('recent_actions', [])}\n"
+        f"Recent obs: {meta.get('recent_obs', [])}\n"
+        f"Resulted in reward: {meta.get('reward')} (score {meta.get('score_prev')} → {meta.get('score_curr')})\n"
+    )
+
+
 def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, meta: dict = None) -> str:
     """
     Write a SUCCESS memory record.
@@ -48,8 +72,30 @@ def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, me
     
     logger.info(f"[AMM Writer] Writing SUCCESS memory ({tag or 'default'}): {rec.goal_signature}")
     
+    # Format the memory content using the readable formatter
+    content = format_episodic_memory_entry(
+        goal=rec.goal_signature,
+        action=rec.action_text,
+        observation=rec.obs_text,
+        meta=rec.meta
+    )
+    
+    # Build payload with formatted content
+    payload = {
+        "content": content,
+        "meta": rec.meta,
+        "tags": []
+    }
+    
+    # Build tags list
+    tags = [rec.type]
+    if tag:
+        tags.append(tag)
+    
+    logger.info(f"[AMM Writer] Formatted content length: {len(content)} chars, tags: {tags}")
+    
     # TODO: Add de-dup hook (amm/dedup.py) in future phases
-    return client.add_tagged(rec.to_dict(), "episodic_success")
+    return client.add_tagged(payload, *tags)
 
 
 def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, meta: dict = None) -> str:
@@ -79,7 +125,29 @@ def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, m
     
     logger.info(f"[AMM Writer] Writing NEARMISS memory ({tag or 'default'}): {rec.goal_signature}")
     
-    return client.add_tagged(rec.to_dict(), "episodic_nearmiss")
+    # Format the memory content using the readable formatter
+    content = format_episodic_memory_entry(
+        goal=rec.goal_signature,
+        action=rec.action_text,
+        observation=rec.obs_text,
+        meta=rec.meta
+    )
+    
+    # Build payload with formatted content
+    payload = {
+        "content": content,
+        "meta": rec.meta,
+        "tags": []
+    }
+    
+    # Build tags list
+    tags = [rec.type]
+    if tag:
+        tags.append(tag)
+    
+    logger.info(f"[AMM Writer] Formatted content length: {len(content)} chars, tags: {tags}")
+    
+    return client.add_tagged(payload, *tags)
 
 
 def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, meta: dict = None) -> str:
@@ -112,14 +180,37 @@ def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, 
     
     logger.info(f"[AMM Writer] Writing AVOIDANCE memory ({tag or 'default'}): {rec.goal_signature}")
     
-    return client.add_tagged(rec.to_dict(), "avoidance")
+    # Format the memory content using the readable formatter
+    content = format_episodic_memory_entry(
+        goal=rec.goal_signature,
+        action=rec.action_text,
+        observation=rec.obs_text,
+        meta=rec.meta
+    )
+    
+    # Build payload with formatted content
+    payload = {
+        "content": content,
+        "meta": rec.meta,
+        "tags": []
+    }
+    
+    # Build tags list
+    tags = [rec.type]
+    if tag:
+        tags.append(tag)
+    
+    logger.info(f"[AMM Writer] Formatted content length: {len(content)} chars, tags: {tags}")
+    
+    return client.add_tagged(payload, *tags)
 
 
 def create_memory_record(
     goal_signature: str,
     action_text: str,
     obs_text: str,
-    memory_type: str = "episodic_success"
+    memory_type: str = "episodic_success",
+    meta: dict = None
 ) -> MemoryRecord:
     """
     Create a basic memory record from action/observation data.
@@ -132,13 +223,28 @@ def create_memory_record(
         action_text: Action that was executed
         obs_text: Observation received
         memory_type: Type of memory (will be overridden by writer functions)
+        meta: Optional additional metadata to merge (room, inventory, reward, etc.)
         
     Returns:
         MemoryRecord instance
     """
+    # Start with base meta including timestamp
+    base_meta = {"created_ts": _now_ts()}
+    
+    # Merge additional meta if provided
+    if meta:
+        try:
+            base_meta.update(meta)
+        except Exception as e:
+            # Be tolerant of non-dict meta
+            logger.warning(f"[AMM Writer] Could not merge meta: {e}")
+            base_meta["meta_str"] = str(meta)
+    
     return MemoryRecord(
-        type=memory_type,
         goal_signature=goal_signature,
+        action_text=action_text,
+        obs_text=obs_text,
+        type=memory_type,
         state_fingerprint=[],  # TODO: Add canonical room/flags in future phases
         preconds_satisfied=[],  # TODO: Optional in Phase 1
         preconds_missing=[],    # TODO: Optional in Phase 1
@@ -148,5 +254,5 @@ def create_memory_record(
         summary=f"Action '{action_text}' led to obs '{obs_text[:80]}'",
         success_weight=1,
         avoid_tags=[],
-        meta={}
+        meta=base_meta
     )
