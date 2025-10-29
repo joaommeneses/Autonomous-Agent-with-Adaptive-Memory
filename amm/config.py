@@ -7,15 +7,16 @@ All constants and thresholds are defined here for easy tuning.
 
 from dataclasses import dataclass
 from typing import List
-
+import os
 
 @dataclass
 class AMMConfig:
     """Configuration for the Adaptive Memory Module"""
     
     # Agent configuration
-    agent_name: str = "MemoryAgent"
-    base_url: str = "https://0936-2001-8a0-57f3-d400-1951-5829-3cd4-ba4b.ngrok-free.app"
+    agent_name: str = "memory-agent"
+    agent_id: str = os.getenv("LETTA_AGENT_ID", "")
+    api_token: str = os.getenv("LETTA_API_TOKEN", "")
     
     # Reward thresholds (raw score deltas, not normalized)
     R_TERMINAL: float = 30.0         # raw reward threshold for terminal focus
