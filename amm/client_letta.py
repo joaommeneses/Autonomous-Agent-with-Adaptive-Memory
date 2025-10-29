@@ -5,10 +5,12 @@ Refactored Letta client for the Adaptive Memory Module.
 Centralizes agent creation and memory operations.
 """
 
+import json
 import logging
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
-from letta_client import CreateBlock, Letta, MessageCreate
+from typing import Any, Dict, List, Optional, Union
+from letta_client import Letta, MessageCreate
 
 logger = logging.getLogger(__name__)
 
@@ -16,12 +18,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class LettaConfig:
     """Configuration for Letta client"""
-    agent_name: str = "MemoryAgent"
-    base_url: str = "https://0936-2001-8a0-57f3-d400-1951-5829-3cd4-ba4b.ngrok-free.app"
-    model: str = "openai/letta-free"
-    embedding: str = "hugging-face/letta-free"
-    context_window_limit: int = 1000000
-    include_base_tools: bool = True
+    api_token: str
+    agent_id: str
+    agent_name: str = "memory-agent"  # Kept for backwards compatibility, not used with cloud API
 
 
 class AMMLettaClient:
@@ -34,52 +33,53 @@ class AMMLettaClient:
     
     def __init__(self, cfg: LettaConfig):
         self.cfg = cfg
-        self.client = Letta(base_url=cfg.base_url)
-        self.agent_id = self.get_or_create_agent(cfg.agent_name)
+        self.client = Letta(token=cfg.api_token)
+        self.agent_id = cfg.agent_id
         logger.info(f"AMM Letta client initialized with agent: {self.agent_id}")
     
-    def get_or_create_agent(self, agent_name: str) -> str:
+    def _retry_with_backoff(self, func, max_retries: int = 5, initial_delay: float = 1.0):
         """
-        Get existing agent or create a new one.
+        Retry a function with exponential backoff.
         
-        This refactors the agent creation logic from eval_agent_fast_slow.py
+        Args:
+            func: Callable to execute (should raise exception on failure)
+            max_retries: Maximum number of retry attempts
+            initial_delay: Initial delay in seconds (will be doubled each retry)
+            
+        Returns:
+            Result from func
+            
+        Raises:
+            Last exception if all retries fail
         """
-        try:
-            # Try to get existing agent by hardcoded ID (matching existing code)
-            mem_agent = self.client.agents.retrieve(agent_id="agent-0c985fd5-2b07-43c4-adba-0fb6ef6fe520")
-            if mem_agent is not None:
-                logger.info(f"Found existing Letta agent: {mem_agent}")
-                return mem_agent.id
-            else:
-                raise Exception("Agent not found")
-        except Exception as e:
-            logger.info(f"Agent '{agent_name}' not found, creating it...")
-            
-            # System prompt for the memory agent
-            system_prompt = (
-                "You are a memory agent that stores and retrieves episodic memories "
-                "for an AI agent working in ScienceWorld. You help the agent learn "
-                "from past experiences by storing successful actions, near-misses, "
-                "and avoidance patterns."
-            )
-            
-            # Create new agent
-            mem_agent = self.client.agents.create(
-                name=agent_name,
-                memory_blocks=[CreateBlock(
-                    value="Memory: Episodic",
-                    label="episodic_memory",
-                )],
-                system=system_prompt,
-                agent_type="memgpt_agent",
-                model=self.cfg.model,
-                embedding=self.cfg.embedding,
-                context_window_limit=self.cfg.context_window_limit,
-                include_base_tools=self.cfg.include_base_tools
-            )
-            
-            logger.info(f"Created new Letta agent: {mem_agent}")
-            return mem_agent.id
+        delay = initial_delay
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
+                return func()
+            except Exception as e:
+                last_exception = e
+                error_msg = str(e).lower()
+                
+                # Check if it's a retryable error (timeout, connection issues)
+                is_retryable = any(keyword in error_msg for keyword in [
+                    'timeout', 'timed out', 'connection', 'temporary', 'unavailable'
+                ])
+                
+                if not is_retryable or attempt == max_retries - 1:
+                    # Non-retryable error or last attempt - raise immediately
+                    raise
+                
+                logger.warning(
+                    f"[AMM Letta] Request failed (attempt {attempt + 1}/{max_retries}): {e}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                time.sleep(delay)
+                delay *= 2  # Exponential backoff
+        
+        # Should never reach here, but just in case
+        raise last_exception
     
     def add_memory(self, memory: Dict[str, Any]) -> str:
         """
@@ -91,7 +91,7 @@ class AMMLettaClient:
         Returns:
             Memory ID (for now, returns a placeholder)
         """
-        try:
+        def _send_memory():
             # Format the memory as a message to the agent
             memory_text = self._format_memory_for_storage(memory)
             
@@ -110,39 +110,89 @@ class AMMLettaClient:
             for chunk in stream:
                 logger.debug(f"[AMM Letta] Memory storage chunk: {chunk}")
             
-            # Reset message context to avoid overflow
-            self.client.agents.messages.reset(
-                agent_id=self.agent_id, 
-                add_default_initial_messages=True
-            )
-            
+            return "memory_placeholder_id"
+        
+        try:
+            result = self._retry_with_backoff(_send_memory)
             logger.info(f"[AMM Letta] Memory stored successfully")
-            return "memory_placeholder_id"  # TODO: Return actual memory ID when available
+            return result
             
         except Exception as e:
-            logger.error(f"[AMM Letta] Failed to store memory: {e}")
+            logger.error(f"[AMM Letta] Failed to store memory after retries: {e}")
             raise
     
-    def add_tagged(self, payload: Dict[str, Any], tag: str) -> str:
+    def add_tagged(self, record: Union[Dict[str, Any], str], *tags: str) -> str:
         """
-        Convenience method to add memory with a specific tag.
+        Insert memory using archival_memory_insert base tool.
         
         Args:
-            payload: Memory data
-            tag: Tag to add (episodic_success, episodic_nearmiss, avoidance)
+            record: Memory payload dict or JSON string
+            *tags: Tags to add (e.g., "episodic_success", "milestone")
             
         Returns:
-            Memory ID
+            Memory ID if available, else ""
         """
-        # Ensure tags field exists
-        if "tags" not in payload:
-            payload["tags"] = []
+        # 1) Normalize payload to dict
+        if isinstance(record, str):
+            try:
+                record = json.loads(record)
+            except Exception:
+                record = {"content": record, "meta": {}, "tags": []}
         
-        # Add tag if not already present
-        if tag not in payload["tags"]:
-            payload["tags"].append(tag)
+        payload = dict(record)  # shallow copy is fine
         
-        return self.add_memory(payload)
+        content = str(payload.get("content", "")).strip()
+        meta = payload.get("meta", {}) or {}
+        existing_tags = payload.get("tags", []) or []
+        
+        # Combine tags (order-preserving unique)
+        all_tags = list(dict.fromkeys([*existing_tags, *tags]))
+        
+        # Convert metadata to JSON
+        try:
+            meta_json = json.dumps(meta, ensure_ascii=False)
+        except Exception:
+            meta_json = str(meta)
+        
+        # Build the tool invocation message
+        tool_cmd = (
+            "Use the base tool `archival_memory_insert` with these args.\n"
+            f"content:\n{content}\n"
+            f"tags: {json.dumps(all_tags)}\n"
+            f"metadata: {meta_json}"
+        )
+        
+        logger.info(
+            f"[AMM Letta] Invoking archival_memory_insert: "
+            f"content_len={len(content)}, tags={all_tags}, meta_keys={list(meta.keys())}"
+        )
+        logger.info(f"[AMM Letta] Full content:\n{content[:500]}...")  # Log first 500 chars
+        
+        if not self.agent_id:
+            raise RuntimeError("[AMM Letta] agent_id is not set; cannot send memory write.")
+        
+        def _send_tagged_memory():
+            # Send the tool invocation message
+            stream = self.client.agents.messages.create_stream(
+                agent_id=self.agent_id,
+                messages=[MessageCreate(role="user", content=tool_cmd)]
+            )
+            
+            last_chunk = None
+            for chunk in stream:
+                last_chunk = chunk
+                logger.debug(f"[AMM Letta] stream chunk: {chunk}")
+            
+            return ""
+        
+        try:
+            result = self._retry_with_backoff(_send_tagged_memory)
+            logger.info("[AMM Letta] Stream completed successfully")
+            return result
+        
+        except Exception as e:
+            logger.exception(f"[AMM Letta] archival_memory_insert failed after retries: {e}")
+            raise
     
     def retrieve_memories(self, query: str, top_k: int = 20) -> List[Dict[str, Any]]:
         """
