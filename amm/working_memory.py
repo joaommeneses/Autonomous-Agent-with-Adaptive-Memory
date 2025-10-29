@@ -5,8 +5,29 @@ This maintains the current episode state for memory retrieval and writing.
 It's not persisted and resets between episodes.
 """
 
+import copy as _copy
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, List, Dict, Optional
+
+
+def _safe_copy(x):
+    """
+    Safely copy any object, handling strings and other immutable types.
+    
+    Returns:
+        Copy of the object if possible, otherwise the object itself
+    """
+    try:
+        return x.copy()  # dict or list-like
+    except Exception:
+        # For immutables such as str/int/bool/None, return as-is.
+        # For other objects, fallback to deepcopy.
+        if isinstance(x, (str, int, float, bool, type(None))):
+            return x
+        try:
+            return _copy.deepcopy(x)
+        except Exception:
+            return x
 
 
 @dataclass
@@ -21,8 +42,12 @@ class WorkingMemory:
     pending_subgoal: str = ""
     room: str = ""
     
-    # Current state
-    inventory: List[str] = field(default_factory=list)
+    # Current state - inventory handling
+    inventory_text: str = ""  # Canonical text snapshot from env
+    inventory_items: List[str] = field(default_factory=list)  # Normalized list
+    inventory: Any = field(default_factory=list)  # Backward-compatible
+    
+    # Other state
     last_obs_keyphrases: List[str] = field(default_factory=list)
     
     # Preconditions tracking
@@ -55,18 +80,57 @@ class WorkingMemory:
         """Update current room"""
         self.room = room
     
-    def update_inventory(self, inventory: List[str]):
-        """Update current inventory"""
-        self.inventory = inventory.copy()
+    def update_inventory(self, inventory: Any):
+        """
+        Accepts the ScienceWorld inventory (often a STRING) and stores both:
+          - inventory_text: str (canonical textual snapshot)
+          - inventory_items: list[str] (best-effort normalization)
+        Never calls .copy() on a string.
+        """
+        # Default reset
+        self.inventory_text = ""
+        self.inventory_items = []
+        
+        # Normalize based on type
+        if isinstance(inventory, (list, tuple)):
+            self.inventory_items = list(inventory)
+            self.inventory_text = "; ".join(map(str, self.inventory_items))
+        elif isinstance(inventory, dict):
+            # Keep keys as items; preserve a readable text too
+            self.inventory_items = list(inventory.keys())
+            try:
+                import json
+                self.inventory_text = json.dumps(inventory)
+            except Exception:
+                self.inventory_text = str(inventory)
+        else:
+            # Most common case in ScienceWorld: a plain descriptive string
+            self.inventory_text = str(inventory)
+        
+        # Keep backward-compatible attribute if used elsewhere
+        self.inventory = _safe_copy(self.inventory_items) if self.inventory_items else self.inventory_text
+        
+        # Optional: type debug logging
+        try:
+            from amm.config import DEFAULT_CONFIG
+            if getattr(DEFAULT_CONFIG, "debug_types", False):
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(
+                    f"[WM] inventory_text(type={type(self.inventory_text).__name__}), "
+                    f"inventory_items(type={type(self.inventory_items).__name__}, len={len(self.inventory_items)})"
+                )
+        except Exception:
+            pass
     
-    def update_obs_keyphrases(self, keyphrases: List[str]):
+    def update_obs_keyphrases(self, keyphrases):
         """Update observation keyphrases"""
-        self.last_obs_keyphrases = keyphrases.copy()
+        self.last_obs_keyphrases = _safe_copy(keyphrases)
     
-    def update_preconds(self, satisfied: List[str], missing: List[str]):
+    def update_preconds(self, satisfied, missing):
         """Update precondition tracking"""
-        self.preconds_satisfied = satisfied.copy()
-        self.preconds_missing = missing.copy()
+        self.preconds_satisfied = _safe_copy(satisfied)
+        self.preconds_missing = _safe_copy(missing)
     
     def increment_cycles_without_progress(self):
         """Increment the counter for cycles without progress"""
@@ -85,6 +149,8 @@ class WorkingMemory:
         return {
             "pending_subgoal": self.pending_subgoal,
             "room": self.room,
+            "inventory_text": self.inventory_text,
+            "inventory_items": self.inventory_items,
             "inventory": self.inventory,
             "last_obs_keyphrases": self.last_obs_keyphrases,
             "preconds_satisfied": self.preconds_satisfied,
