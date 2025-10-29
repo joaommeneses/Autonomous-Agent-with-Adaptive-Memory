@@ -140,13 +140,25 @@ def eval(args, task_num, logger):
     from amm.config import DEFAULT_CONFIG
 
     # Initialize AMM client and working memory
+    # Get API token and agent ID from environment or config
+    letta_api_token = os.getenv("LETTA_API_TOKEN")
+    letta_agent_id = os.getenv("LETTA_AGENT_ID")
+    
+    if not letta_api_token or not letta_agent_id:
+        raise ValueError(
+            "LETTA_API_TOKEN and LETTA_AGENT_ID environment variables must be set. "
+            "Please set them before running the agent."
+        )
+    
     amm_config = LettaConfig(
-        agent_name="MemoryAgent",
-        base_url="https://0936-2001-8a0-57f3-d400-1951-5829-3cd4-ba4b.ngrok-free.app"
+        api_token=letta_api_token,
+        agent_id=letta_agent_id,
+        agent_name="memory-agent"
     )
     amm_client = AMMLettaClient(amm_config)
     wm = WorkingMemory()
-    logger.info("[AMM] Adaptive Memory Module initialized")
+    logger.info("[AMM] Adaptive Memory Module initialized with Cloud API")
+    logger.info(f"[AMM] Using agent ID: {letta_agent_id}")
     # =================
 
     for variation in variations:
@@ -526,11 +538,26 @@ def eval(args, task_num, logger):
                 # Build goal signature
                 goal_sig = task_description
                 
-                # Create memory record
+                # Build rich context metadata
+                inventory_str = getattr(wm, "inventory_text", None) or str(env.inventory())
+                ctx_meta = {
+                    "room": current_place,
+                    "inventory_text": inventory_str,
+                    "recent_actions": recent_actions[-5:] if len(recent_actions) > 5 else recent_actions,
+                    "recent_obs": [o[:100] for o in recent_obs[-5:]] if len(recent_obs) > 5 else [o[:100] for o in recent_obs],
+                    "reward": reward,
+                    "score_prev": last_score,
+                    "score_curr": score,
+                    "done": bool(done),
+                    "focus_targets": to_focus,
+                }
+                
+                # Create memory record with rich context
                 rec = create_memory_record(
                     goal_signature=goal_sig,
                     action_text=action,
-                    obs_text=obs
+                    obs_text=obs,
+                    meta=ctx_meta
                 )
 
                 # Normalize
