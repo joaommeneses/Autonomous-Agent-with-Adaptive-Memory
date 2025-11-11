@@ -12,6 +12,8 @@ import time
 from typing import Dict, Any
 from .schema import MemoryRecord
 from .client_letta import AMMLettaClient
+from .tagging import classify_episode, append_tags_to_content, TaggingError
+from .config import DEFAULT_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -52,25 +54,60 @@ def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, me
     Args:
         client: AMM Letta client
         rec: Memory record (type will be set to episodic_success)
-        tag: Optional tag for the success type (e.g., "terminal", "product-made", "reward-validated")
+        tag: Optional tag (legacy, now ignored - classification happens automatically)
         meta: Optional additional metadata to merge into the record's meta
         
     Returns:
         Memory ID
     """
-    rec.type = "episodic_success"
     rec.meta.setdefault("created_ts", _now_ts())
     rec.meta["last_seen_ts"] = rec.meta["created_ts"]
-    
-    # Add tag to meta if provided
-    if tag:
-        rec.meta["success_tag"] = tag
     
     # Merge additional meta if provided
     if meta:
         rec.meta.update(meta)
     
-    logger.info(f"[AMM Writer] Writing SUCCESS memory ({tag or 'default'}): {rec.goal_signature}")
+    # Classify episode using tagging system
+    try:
+        result = classify_episode(
+            action=rec.action_text,
+            observation=rec.obs_text,
+            reward=rec.meta.get("reward", 0.0),
+            score_prev=rec.meta.get("score_prev"),
+            score_curr=rec.meta.get("score_curr"),
+            done=rec.meta.get("done"),
+            goal_text=rec.goal_signature,
+            milestone_threshold=DEFAULT_CONFIG.MILESTONE_THRESHOLD,
+            small_reward_threshold=DEFAULT_CONFIG.SMALL_REWARD_THRESHOLD,
+            shaping_actions=DEFAULT_CONFIG.SHAPING_ACTIONS
+        )
+    except Exception as e:
+        logger.warning(f"[AMM Writer] Classification failed: {e}")
+        result = None
+    
+    # Skip writing if non-eventful or unclassifiable
+    if result is None:
+        logger.debug(
+            f"[AMM Writer] EM skipped: non-eventful step. "
+            f"action={rec.action_text[:50]}, reward={rec.meta.get('reward', 0.0)}, done={rec.meta.get('done')}"
+        )
+        return ""  # Return empty string to indicate no memory was written
+    
+    primary, subtag = result
+    
+    # Set type based on classification result
+    rec.type = primary
+    
+    # Log with detailed info: action, primary, subtag, computed_reward, s_prev→s_curr
+    reward_val = rec.meta.get('reward', 0.0)
+    score_prev = rec.meta.get('score_prev')
+    score_curr = rec.meta.get('score_curr')
+    score_str = f"{score_prev} → {score_curr}" if (score_prev is not None and score_curr is not None) else "N/A"
+    logger.info(
+        f"[AMM Writer] Writing SUCCESS memory: "
+        f"action='{rec.action_text[:50]}', primary={primary}, subtag={subtag}, "
+        f"reward={reward_val}, score={score_str}"
+    )
     
     # Format the memory content using the readable formatter
     content = format_episodic_memory_entry(
@@ -80,22 +117,16 @@ def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, me
         meta=rec.meta
     )
     
-    # Build payload with formatted content
-    payload = {
-        "content": content,
-        "meta": rec.meta,
-        "tags": []
-    }
+    # Append tags to content
+    content_with_tags = append_tags_to_content(content, primary, subtag)
     
-    # Build tags list
-    tags = [rec.type]
-    if tag:
-        tags.append(tag)
+    # Build payload with only content (tags are embedded)
+    payload = {"content": content_with_tags}
     
-    logger.info(f"[AMM Writer] Formatted content length: {len(content)} chars, tags: {tags}")
+    logger.info(f"[AMM Writer] Formatted content length: {len(content_with_tags)} chars, tags: {primary}" + (f", {subtag}" if subtag else ""))
     
     # TODO: Add de-dup hook (amm/dedup.py) in future phases
-    return client.add_tagged(payload, *tags)
+    return client.add_tagged(payload)
 
 
 def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, meta: dict = None) -> str:
@@ -105,25 +136,60 @@ def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, m
     Args:
         client: AMM Letta client
         rec: Memory record (type will be set to episodic_nearmiss)
-        tag: Optional tag for the nearmiss type (e.g., "progress")
+        tag: Optional tag (legacy, now ignored - classification happens automatically)
         meta: Optional additional metadata to merge into the record's meta
         
     Returns:
         Memory ID
     """
-    rec.type = "episodic_nearmiss"
     rec.meta.setdefault("created_ts", _now_ts())
     rec.meta["last_seen_ts"] = rec.meta["created_ts"]
-    
-    # Add tag to meta if provided
-    if tag:
-        rec.meta["nearmiss_tag"] = tag
     
     # Merge additional meta if provided
     if meta:
         rec.meta.update(meta)
     
-    logger.info(f"[AMM Writer] Writing NEARMISS memory ({tag or 'default'}): {rec.goal_signature}")
+    # Classify episode using tagging system
+    try:
+        result = classify_episode(
+            action=rec.action_text,
+            observation=rec.obs_text,
+            reward=rec.meta.get("reward", 0.0),
+            score_prev=rec.meta.get("score_prev"),
+            score_curr=rec.meta.get("score_curr"),
+            done=rec.meta.get("done"),
+            goal_text=rec.goal_signature,
+            milestone_threshold=DEFAULT_CONFIG.MILESTONE_THRESHOLD,
+            small_reward_threshold=DEFAULT_CONFIG.SMALL_REWARD_THRESHOLD,
+            shaping_actions=DEFAULT_CONFIG.SHAPING_ACTIONS
+        )
+    except Exception as e:
+        logger.warning(f"[AMM Writer] Classification failed: {e}")
+        result = None
+    
+    # Skip writing if non-eventful or unclassifiable
+    if result is None:
+        logger.debug(
+            f"[AMM Writer] EM skipped: non-eventful step. "
+            f"action={rec.action_text[:50]}, reward={rec.meta.get('reward', 0.0)}, done={rec.meta.get('done')}"
+        )
+        return ""  # Return empty string to indicate no memory was written
+    
+    primary, subtag = result
+    
+    # Set type based on classification result
+    rec.type = primary
+    
+    # Log with detailed info: action, primary, subtag, computed_reward, s_prev→s_curr
+    reward_val = rec.meta.get('reward', 0.0)
+    score_prev = rec.meta.get('score_prev')
+    score_curr = rec.meta.get('score_curr')
+    score_str = f"{score_prev} → {score_curr}" if (score_prev is not None and score_curr is not None) else "N/A"
+    logger.info(
+        f"[AMM Writer] Writing NEARMISS memory: "
+        f"action='{rec.action_text[:50]}', primary={primary}, subtag={subtag}, "
+        f"reward={reward_val}, score={score_str}"
+    )
     
     # Format the memory content using the readable formatter
     content = format_episodic_memory_entry(
@@ -133,21 +199,15 @@ def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, m
         meta=rec.meta
     )
     
-    # Build payload with formatted content
-    payload = {
-        "content": content,
-        "meta": rec.meta,
-        "tags": []
-    }
+    # Append tags to content
+    content_with_tags = append_tags_to_content(content, primary, subtag)
     
-    # Build tags list
-    tags = [rec.type]
-    if tag:
-        tags.append(tag)
+    # Build payload with only content (tags are embedded)
+    payload = {"content": content_with_tags}
     
-    logger.info(f"[AMM Writer] Formatted content length: {len(content)} chars, tags: {tags}")
+    logger.info(f"[AMM Writer] Formatted content length: {len(content_with_tags)} chars, tags: {primary}" + (f", {subtag}" if subtag else ""))
     
-    return client.add_tagged(payload, *tags)
+    return client.add_tagged(payload)
 
 
 def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, meta: dict = None) -> str:
@@ -157,28 +217,63 @@ def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, 
     Args:
         client: AMM Letta client
         rec: Memory record (type will be set to avoidance)
-        tag: Optional tag for the avoidance type (e.g., "shaping-decoy", "exec-invalid")
+        tag: Optional tag (legacy, now ignored - classification happens automatically)
         meta: Optional additional metadata to merge into the record's meta
         
     Returns:
         Memory ID
     """
-    rec.type = "avoidance"
     rec.meta.setdefault("created_ts", _now_ts())
     rec.meta["last_seen_ts"] = rec.meta["created_ts"]
     
     # Add TTL for avoidance memories (50 episodes as per spec)
     rec.meta["ttl_steps"] = 50
     
-    # Add tag to meta if provided
-    if tag:
-        rec.meta["avoidance_tag"] = tag
-    
     # Merge additional meta if provided
     if meta:
         rec.meta.update(meta)
     
-    logger.info(f"[AMM Writer] Writing AVOIDANCE memory ({tag or 'default'}): {rec.goal_signature}")
+    # Classify episode using tagging system
+    try:
+        result = classify_episode(
+            action=rec.action_text,
+            observation=rec.obs_text,
+            reward=rec.meta.get("reward", 0.0),
+            score_prev=rec.meta.get("score_prev"),
+            score_curr=rec.meta.get("score_curr"),
+            done=rec.meta.get("done"),
+            goal_text=rec.goal_signature,
+            milestone_threshold=DEFAULT_CONFIG.MILESTONE_THRESHOLD,
+            small_reward_threshold=DEFAULT_CONFIG.SMALL_REWARD_THRESHOLD,
+            shaping_actions=DEFAULT_CONFIG.SHAPING_ACTIONS
+        )
+    except Exception as e:
+        logger.warning(f"[AMM Writer] Classification failed: {e}")
+        result = None
+    
+    # Skip writing if non-eventful or unclassifiable
+    if result is None:
+        logger.debug(
+            f"[AMM Writer] EM skipped: non-eventful step. "
+            f"action={rec.action_text[:50]}, reward={rec.meta.get('reward', 0.0)}, done={rec.meta.get('done')}"
+        )
+        return ""  # Return empty string to indicate no memory was written
+    
+    primary, subtag = result
+    
+    # Set type based on classification result
+    rec.type = primary
+    
+    # Log with detailed info: action, primary, subtag, computed_reward, s_prev→s_curr
+    reward_val = rec.meta.get('reward', 0.0)
+    score_prev = rec.meta.get('score_prev')
+    score_curr = rec.meta.get('score_curr')
+    score_str = f"{score_prev} → {score_curr}" if (score_prev is not None and score_curr is not None) else "N/A"
+    logger.info(
+        f"[AMM Writer] Writing AVOIDANCE memory: "
+        f"action='{rec.action_text[:50]}', primary={primary}, subtag={subtag}, "
+        f"reward={reward_val}, score={score_str}"
+    )
     
     # Format the memory content using the readable formatter
     content = format_episodic_memory_entry(
@@ -188,21 +283,15 @@ def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, 
         meta=rec.meta
     )
     
-    # Build payload with formatted content
-    payload = {
-        "content": content,
-        "meta": rec.meta,
-        "tags": []
-    }
+    # Append tags to content
+    content_with_tags = append_tags_to_content(content, primary, subtag)
     
-    # Build tags list
-    tags = [rec.type]
-    if tag:
-        tags.append(tag)
+    # Build payload with only content (tags are embedded)
+    payload = {"content": content_with_tags}
     
-    logger.info(f"[AMM Writer] Formatted content length: {len(content)} chars, tags: {tags}")
+    logger.info(f"[AMM Writer] Formatted content length: {len(content_with_tags)} chars, tags: {primary}" + (f", {subtag}" if subtag else ""))
     
-    return client.add_tagged(payload, *tags)
+    return client.add_tagged(payload)
 
 
 def create_memory_record(

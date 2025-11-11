@@ -6,38 +6,28 @@ All constants and thresholds are defined here for easy tuning.
 """
 
 from dataclasses import dataclass
-from typing import List
 import os
 
 @dataclass
 class AMMConfig:
     """Configuration for the Adaptive Memory Module"""
     
-    # Agent configuration
+    # ==================== Agent Configuration ====================
     agent_name: str = "memory-agent"
     agent_id: str = os.getenv("LETTA_AGENT_ID", "")
     api_token: str = os.getenv("LETTA_API_TOKEN", "")
     
-    # Reward thresholds (raw score deltas, not normalized)
-    R_TERMINAL: float = 30.0         # raw reward threshold for terminal focus
-    R_MILESTONE: float = 8.0         # raw reward threshold for milestone success (catches +10, +20)
+    # ==================== Tagging Thresholds ====================
+    # Thresholds for episodic memory classification (raw score deltas)
+    MILESTONE_THRESHOLD: float = 20.0  # Reward >= this → episodic_success + milestone
+    SMALL_REWARD_THRESHOLD: float = 5.0  # Reward <= this → episodic_nearmiss + partial (if not milestone)
     
-    # Action classification
-    SHAPING_ACTIONS: set = None     # Actions that are considered shaping (wait, wait1)
+    # ==================== Action Classification ====================
+    # Actions that are considered shaping/delayed reward actions
+    SHAPING_ACTIONS: set = None  # Defaults to {"wait", "wait1", "wait2"} in __post_init__
     
-    # Success and progress cues (conservative lists)
-    PRODUCE_CUES: List[str] = None  # Used with mix context
-    PROGRESS_CUES: List[str] = None # General progress indicators
-    
-    # Avoidance error substrings (keep short)
-    FAILURE_CUES: List[str] = None
-    
-    # Legacy memory writing thresholds (kept for compatibility)
-    success_reward_threshold: float = 0.0  # Write SUCCESS if reward > this
-    nearmiss_keywords: List[str] = None  # Keywords that indicate credible progress
-    avoidance_keywords: List[str] = None  # Keywords that indicate invalid/blocked actions
-    
-    # Retrieval configuration (for future phases)
+    # ==================== Future Phase Configuration ====================
+    # Retrieval configuration (for Phase 2+)
     retrieval_top_k: int = 20
     budgeted_k_easy: int = 3
     budgeted_k_medium: int = 5
@@ -60,31 +50,9 @@ class AMMConfig:
     skill_promotion_threshold: int = 3
     
     def __post_init__(self):
-        """Set default keyword lists if not provided"""
+        """Initialize default values for mutable types"""
         if self.SHAPING_ACTIONS is None:
-            self.SHAPING_ACTIONS = {"wait", "wait1"}
-        
-        if self.PRODUCE_CUES is None:
-            self.PRODUCE_CUES = ["produce", "created", "create", "formed", "form"]
-        
-        if self.PROGRESS_CUES is None:
-            self.PROGRESS_CUES = ["pour", "mixed", "mix", "opened", "open", "combined", "combine"]
-        
-        if self.FAILURE_CUES is None:
-            self.FAILURE_CUES = ["can't", "cannot", "not possible", "invalid", "do not have", "won't work"]
-        
-        # Legacy keyword lists (kept for compatibility)
-        if self.nearmiss_keywords is None:
-            self.nearmiss_keywords = [
-                "opened", "unlocked", "lit", "attached", "connected", 
-                "placed", "mounted", "activated", "turned on"
-            ]
-        
-        if self.avoidance_keywords is None:
-            self.avoidance_keywords = [
-                "can't", "cannot", "invalid", "doesn't", "won't work",
-                "not possible", "blocked", "failed"
-            ]
+            self.SHAPING_ACTIONS = {"wait", "wait1", "wait2"}
 
 
 # Default configuration instance

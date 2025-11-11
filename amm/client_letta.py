@@ -126,47 +126,40 @@ class AMMLettaClient:
         Insert memory using archival_memory_insert base tool.
         
         Args:
-            record: Memory payload dict or JSON string
-            *tags: Tags to add (e.g., "episodic_success", "milestone")
+            record: Memory payload dict with "content" field (tags should already be embedded in content)
+            *tags: Deprecated - tags should already be embedded in content. Ignored for backward compatibility.
             
         Returns:
             Memory ID if available, else ""
         """
-        # 1) Normalize payload to dict
+        # Normalize payload to dict
         if isinstance(record, str):
             try:
                 record = json.loads(record)
             except Exception:
-                record = {"content": record, "meta": {}, "tags": []}
+                record = {"content": record}
         
         payload = dict(record)  # shallow copy is fine
         
+        # Extract content (tags should already be embedded by tagging system)
         content = str(payload.get("content", "")).strip()
-        meta = payload.get("meta", {}) or {}
-        existing_tags = payload.get("tags", []) or []
         
-        # Combine tags (order-preserving unique)
-        all_tags = list(dict.fromkeys([*existing_tags, *tags]))
+        if not content:
+            raise ValueError("[AMM Letta] Content is required and cannot be empty")
         
-        # Convert metadata to JSON
-        try:
-            meta_json = json.dumps(meta, ensure_ascii=False)
-        except Exception:
-            meta_json = str(meta)
-        
-        # Build the tool invocation message
+        # Build the tool invocation message (content already includes tags)
         tool_cmd = (
             "Use the base tool `archival_memory_insert` with these args.\n"
             f"content:\n{content}\n"
-            f"tags: {json.dumps(all_tags)}\n"
-            f"metadata: {meta_json}"
         )
         
         logger.info(
             f"[AMM Letta] Invoking archival_memory_insert: "
-            f"content_len={len(content)}, tags={all_tags}, meta_keys={list(meta.keys())}"
+            f"content_len={len(content)}"
         )
-        logger.info(f"[AMM Letta] Full content:\n{content[:500]}...")  # Log first 500 chars
+        # Log the final content that will be sent (showing tags if present)
+        content_preview = content[:500] + "..." if len(content) > 500 else content
+        logger.info(f"[AMM Letta] Content:\n{content_preview}")
         
         if not self.agent_id:
             raise RuntimeError("[AMM Letta] agent_id is not set; cannot send memory write.")

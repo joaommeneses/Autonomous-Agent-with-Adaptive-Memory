@@ -14,6 +14,7 @@ from .working_memory import WorkingMemory
 from .client_letta import AMMLettaClient, LettaConfig
 from .writer import write_success, write_nearmiss, write_avoidance
 from .config import AMMConfig, DEFAULT_CONFIG
+from .tagging import classify_episode, append_tags_to_content, validate_tags, TaggingError, is_eventful
 
 __version__ = "0.1.0"
 __all__ = [
@@ -26,5 +27,10 @@ __all__ = [
     "write_nearmiss", 
     "write_avoidance",
     "AMMConfig",
-    "DEFAULT_CONFIG"
+    "DEFAULT_CONFIG",
+    "classify_episode",
+    "append_tags_to_content",
+    "validate_tags",
+    "TaggingError",
+    "is_eventful"
 ]

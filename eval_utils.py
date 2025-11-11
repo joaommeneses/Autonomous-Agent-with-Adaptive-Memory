@@ -141,7 +141,7 @@ def load_variation(env, args, task_num, logger):
         variations = list(env.getVariationsTest())
         if len(variations) > 5:
             # variations = variations[:5]
-            variations = variations[:2] # ===== TESTING PURPOSES
+            variations = variations[:3] # ===== TESTING PURPOSES
     elif (args["set"] == "dev"):
         variations = list(env.getVariationsDev()) 
         variations = variations[:3]

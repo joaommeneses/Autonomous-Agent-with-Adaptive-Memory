@@ -138,6 +138,7 @@ def eval(args, task_num, logger):
     from amm.writer import write_success, write_nearmiss, write_avoidance, create_memory_record
     from amm.schema import MemoryRecord
     from amm.config import DEFAULT_CONFIG
+    from amm.tagging import classify_episode
 
     # Initialize AMM client and working memory
     # Get API token and agent ID from environment or config
@@ -330,16 +331,21 @@ def eval(args, task_num, logger):
                     for act_cand in action_trials:
                         if not act_cand:
                             continue 
-                        obs, reward, done, info = env.step(act_cand)
+                        obs_buf, reward_buf, done_buf, info_buf = env.step(act_cand)
                         logger.info(f"Trying to execute [{act_cand}] in the buffer.")  
-                        if is_action_failed(obs):
-                            logger.info(f"\t\t Failed: [{act_cand}] --> {obs}")
-                            # failed_messages.append(f"\t\t Failed action: [{act_cand}] --> {obs}")
+                        if is_action_failed(obs_buf):
+                            logger.info(f"\t\t Failed: [{act_cand}] --> {obs_buf}")
+                            # failed_messages.append(f"\t\t Failed action: [{act_cand}] --> {obs_buf}")
                             if act_cand == action_candidate:
-                                failed_messages.append(f"\t\t Failed action: (in {current_place}) [{act_cand}] --> {obs}")
+                                failed_messages.append(f"\t\t Failed action: (in {current_place}) [{act_cand}] --> {obs_buf}")
                         else:
                             action_accepted = True 
                             final_action = act_cand
+                            # Update obs, reward, done, info for later use
+                            obs = obs_buf
+                            reward_env = reward_buf
+                            done = done_buf
+                            info = info_buf
                             break  
 
 
@@ -350,6 +356,9 @@ def eval(args, task_num, logger):
                         obs_buffer.pop(action_ind)
                         action = final_action
                         buffer_overall_trail = 0
+                        # Handle ambiguous requests for buffer-executed actions
+                        if obs.startswith("Ambiguous request"):
+                            obs, reward_env, done, info = env.step("0")
                         break 
                     else:
                         failed_action_trial[action_candidate] += 1
@@ -512,23 +521,39 @@ def eval(args, task_num, logger):
             
             # If the action was not already executed in the previous loop, execute it
             if not executed:
-                obs, reward, done, info = env.step(action)
+                obs, reward_env, done, info = env.step(action)
 
+            # Handle ambiguous requests (resolve by choosing "0")
             if obs.startswith("Ambiguous request"):
-                # choose 0
-                obs, reward, done, info = env.step("0")
+                obs, reward_env, done, info = env.step("0")
             
+            # Capture TRUE values from environment immediately after step
+            # Reward is 0 if score doesn't increase (no negative rewards)
+            # Score remains at last_score if it doesn't increase or goes negative
+            score_from_env = info['score']
+            if score_from_env <= last_score or score_from_env < 0:
+                # Score didn't increase or went negative - reward is 0, score unchanged
+                score_true = last_score
+                reward_true = 0.0
+            else:
+                # Score increased - calculate reward as delta
+                score_true = score_from_env
+                reward_true = score_true - last_score
+            
+            # Update current place after step (may have changed)
+            current_place = get_current_room(info['look'])
+            
+            # Update tracking lists with TRUE values
             no_action_done = 0
-            score = info['score']
             prev_action = action
-            reward = score - last_score
-            recent_reward.append(reward/100)
-            recent_scores.append(score/100)
+            recent_reward.append(reward_true/100)
+            recent_scores.append(score_true/100)
             recent_actions.append(action) 
             recent_obs.append(obs)
             recent_locs.append(current_place)
             
-            # === AMM HOOK: POST-STEP WRITE ===
+            # === AMM HOOK: POST-STEP WRITE (BEFORE any score modifications) ===
+            # Write memory with TRUE reward/score values from environment
             try:
                 # Update working memory
                 wm.record_action(action)
@@ -538,17 +563,17 @@ def eval(args, task_num, logger):
                 # Build goal signature
                 goal_sig = task_description
                 
-                # Build rich context metadata
+                # Build rich context metadata with TRUE values
                 inventory_str = getattr(wm, "inventory_text", None) or str(env.inventory())
                 ctx_meta = {
                     "room": current_place,
                     "inventory_text": inventory_str,
                     "recent_actions": recent_actions[-5:] if len(recent_actions) > 5 else recent_actions,
                     "recent_obs": [o[:100] for o in recent_obs[-5:]] if len(recent_obs) > 5 else [o[:100] for o in recent_obs],
-                    "reward": reward,
-                    "score_prev": last_score,
-                    "score_curr": score,
-                    "done": bool(done),
+                    "reward": reward_true,  # TRUE reward from environment
+                    "score_prev": last_score,  # Score before this step
+                    "score_curr": score_true,  # TRUE score from environment (not modified)
+                    "done": bool(done),  # TRUE done flag from environment
                     "focus_targets": to_focus,
                 }
                 
@@ -560,161 +585,88 @@ def eval(args, task_num, logger):
                     meta=ctx_meta
                 )
 
-                # Normalize
-                a_norm = (action or "").strip().lower()
-                o_norm = (obs or "").strip().lower()
-                info_msg = ""
-                if info and isinstance(info, dict):
-                    info_msg = str(info.get("message", "")).lower()
-
-                # Config
-                R_TERMINAL   = DEFAULT_CONFIG.R_TERMINAL
-                R_MILESTONE  = DEFAULT_CONFIG.R_MILESTONE
-                SHAPING      = DEFAULT_CONFIG.SHAPING_ACTIONS
-                PRODUCE_CUES = DEFAULT_CONFIG.PRODUCE_CUES
-                PROGRESS_CUES= DEFAULT_CONFIG.PROGRESS_CUES
-                FAILURE_CUES = DEFAULT_CONFIG.FAILURE_CUES
-
-                def starts_with_any(s: str, prefixes):
-                    return any(s.startswith(p) for p in prefixes)
-
-                def contains_any(s: str, toks):
-                    return any(t in s for t in toks)
-
-                # Helper: extract the focused object from action/obs
-                def extract_focus_target(action_text: str, obs_text: str) -> str:
-                    # Prefer action when available
-                    if action_text and action_text.lower().startswith("focus on"):
-                        return clean_obj_name(action_text.lower().replace("focus on", "", 1).strip())
-                    # Fallback to observation pattern: "you focus on X."
-                    marker = "you focus on"
-                    o = (obs_text or "").lower()
-                    if marker in o:
-                        frag = o.split(marker, 1)[1].strip()
-                        # cut at sentence end if present
-                        if "." in frag:
-                            frag = frag.split(".", 1)[0].strip()
-                        return clean_obj_name(frag)
-                    return ""
-
-                def goal_focus_match(focus_obj: str, goal_targets: list) -> bool:
-                    if not focus_obj or not goal_targets:
-                        return False
-                    f = clean_obj_name((focus_obj or "").lower())
-                    for t in goal_targets:
-                        tt = clean_obj_name((t or "").lower())
-                        # bidirectional substring match to be tolerant of determiners and adjectives
-                        if (tt and f) and (tt in f or f in tt):
-                            return True
-                    return False
-
-                wrote = False  # ensure at most one write per step
-
-                # --- SUCCESS: terminal focus (strict & goal-aligned) ---
-                if ("you focus on" in o_norm) or a_norm.startswith("focus on"):
-                    focus_obj = extract_focus_target(action, obs)
-                    if goal_focus_match(focus_obj, to_focus) and ((reward is not None and reward >= R_TERMINAL) or done):
-                        write_success(amm_client, rec, tag="terminal_focus", meta={"focus_obj": focus_obj, "done": done, "reward": reward})
-                        wm.reset_cycles_without_progress()
-                        wrote = True
-
-                # --- SUCCESS: product made (DISABLED for now; guard by config flag) ---
-                # ENABLE_PRODUCE_SUCCESS = getattr(DEFAULT_CONFIG, "ENABLE_PRODUCE_SUCCESS", False)
-                # if (not wrote) and ENABLE_PRODUCE_SUCCESS:
-                #     # Example placeholder; when re-enabled, broaden beyond 'mix' and require reward >= R_MILESTONE
-                #     if contains_any(o_norm, PRODUCE_CUES) and (reward is not None and reward >= R_MILESTONE):
-                #         write_success(amm_client, rec, tag="product_made")
-                #         wm.reset_cycles_without_progress()
-                #         wrote = True
-
-                # --- SUCCESS: milestone (large positive reward, non-shaping) ---
-                if (not wrote) and (reward is not None) and (reward >= R_MILESTONE) and not starts_with_any(a_norm, SHAPING):
-                    write_success(amm_client, rec, tag="milestone")
-                    wm.reset_cycles_without_progress()
-                    wrote = True
-
-                # --- NEARMISS: positive step (non-shaping, small positive reward) ---
-                if (not wrote) and (reward is not None) and (reward > 0) and (reward < R_MILESTONE) and (not starts_with_any(a_norm, SHAPING)):
-                    write_nearmiss(amm_client, rec, tag="positive-step", meta={"reward": reward})
-                    wm.reset_cycles_without_progress()
-                    wrote = True
-
-                # --- SUCCESS/NEARMISS for time-delayed rewards on shaping actions ---
-                # If a shaping step (e.g., 'wait') yields reward, classify by completion or magnitude.
-                if (not wrote) and starts_with_any(a_norm, SHAPING) and (reward is not None) and (reward > 0):
-                    if done or (reward >= R_TERMINAL):
-                        # Terminal completion or large terminal-level reward happened on a shaping step
-                        write_success(
-                            amm_client,
-                            rec,
-                            tag="terminal-delayed",
-                            meta={"reward": reward, "shaping_action": a_norm, "done": bool(done)}
-                        )
-                        wm.reset_cycles_without_progress()
-                        wrote = True
-                    elif reward >= R_MILESTONE:
-                        # Significant milestone realized via shaping
-                        write_success(
-                            amm_client,
-                            rec,
-                            tag="milestone-delayed",
-                            meta={"reward": reward, "shaping_action": a_norm}
-                        )
-                        wm.reset_cycles_without_progress()
-                        wrote = True
+                # Classify episode using the new tagging system
+                # This determines both primary tag and subtag, and which writer to call
+                try:
+                    result = classify_episode(
+                        action=action,
+                        observation=obs,
+                        reward=reward_true,  # TRUE reward
+                        score_prev=last_score,
+                        score_curr=score_true,  # TRUE score
+                        done=done,  # TRUE done flag
+                        goal_text=goal_sig,
+                        milestone_threshold=DEFAULT_CONFIG.MILESTONE_THRESHOLD,
+                        small_reward_threshold=DEFAULT_CONFIG.SMALL_REWARD_THRESHOLD,
+                        shaping_actions=DEFAULT_CONFIG.SHAPING_ACTIONS
+                    )
+                    
+                    # Skip writing if non-eventful or unclassifiable
+                    if result is None:
+                        wm.increment_cycles_without_progress()
                     else:
-                        # Small incremental gain realized via shaping
-                        write_nearmiss(
-                            amm_client,
-                            rec,
-                            tag="timed-progress",
-                            meta={"reward": reward, "shaping_action": a_norm}
-                        )
-                        wm.reset_cycles_without_progress()
-                        wrote = True
-
-
-                # --- AVOIDANCE: explicit failure cues (execution invalid/blocked/etc.) ---
-                if (not wrote) and info_msg and contains_any(info_msg, FAILURE_CUES):
-                    write_avoidance(amm_client, rec, tag="exec-invalid")
-                    wm.increment_cycles_without_progress()
-                    wrote = True                
-
-                # --- default: no memory ---
-                if not wrote:
+                        primary, subtag = result
+                        
+                        # Call appropriate writer based on primary tag
+                        # The writer will handle embedding tags into content
+                        if primary == "episodic_success":
+                            write_success(amm_client, rec, meta=ctx_meta)
+                            wm.reset_cycles_without_progress()
+                        elif primary == "episodic_nearmiss":
+                            write_nearmiss(amm_client, rec, meta=ctx_meta)
+                            wm.reset_cycles_without_progress()
+                        elif primary == "avoidance":
+                            write_avoidance(amm_client, rec, meta=ctx_meta)
+                            wm.increment_cycles_without_progress()
+                        else:
+                            # Fallback: should not happen, but handle gracefully
+                            logger.warning(f"[AMM] Unknown primary tag: {primary}, skipping memory write")
+                            wm.increment_cycles_without_progress()
+                        
+                except Exception as e:
+                    logger.warning(f"[AMM] Classification failed, no memory written: {e}")
                     wm.increment_cycles_without_progress()
 
             except Exception as e:
                 logger.error(f"[AMM] Memory writing failed: {e}")
             # ===============================
             
+            # Apply score modifications AFTER memory writing (for display/evaluation only)
+            # These modifications do not affect memory records which use TRUE values
+            score = score_true  # Start with true score
+            reward = reward_true  # Start with true reward
+            
             if is_action_failed(obs):
                 logger.info(f"\t\t Failed: [{action}] --> {obs}")
                 failed_messages.append(f"\t\t Failed action: (in {current_place}) [{action}] --> {obs}")
             
-            # if the focus on is useful (positive reward) we will track it ---> maybe we can use it for episodic/semantic memory just like the failure messages TO DO
-            if reward > 0 and action.startswith("focus on"):
+            # if the focus on is useful (positive reward) we will track it
+            if reward_true > 0 and action.startswith("focus on"):
                 useful_focus_on.append(action)
                 if len(useful_focus_on) == max(focus_on_count[str(task_num)], task_description.count("focus")):
                     focus_on_done = True 
 
-            if score < 0 or (len(recent_reward)>=100 and sum(recent_reward[-30:])==0):
+            # Apply score modification logic (for display/evaluation, not for memory)
+            # Note: Memory was already written with TRUE values above
+            if score_true < 0 or (len(recent_reward)>=100 and sum(recent_reward[-30:])==0):
                 # Note: our own solution for dealing with such cases; It is different from the official ScienceWorld evaluation script. You can find our discussion in the Issues.
                 if args["no_stop"]:
                     done = True
-                    score = last_score
+                    score = last_score  # Modified for display only
                 else:
                     done = True
-                    score = 0
+                    score = 0  # Modified for display only
+            
+            # Update last_score for next iteration (use modified score for tracking, but memory uses TRUE values)
             last_score = score
 
             #logger.info("Input string: " + str(input_str))
             logger.info(f"Variation: {variation}, Step: {step}")
             logger.info(f"Action: {action}")
             logger.info("Obs: " + sanitizeStr(obs))
-            logger.info(f"Score: {score}")
-            if recent_reward[-1] > 0:
-                logger.info(f"Reward: +{recent_reward[-1]*100}")
+            logger.info(f"Score: {score}")  # Display score (may be modified for display)
+            if reward_true > 0:
+                logger.info(f"Reward: +{reward_true}")
             else:
                 logger.info("No reward.")
 
