@@ -9,11 +9,12 @@ Implements the three core memory writing functions:
 
 import logging
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from .schema import MemoryRecord
 from .client_letta import AMMLettaClient
-from .tagging import classify_episode, append_tags_to_content, TaggingError
+from .tagging import classify_episode, TaggingError
 from .config import DEFAULT_CONFIG
+from .formatters import format_em_structured, _parse_inventory_text
 
 logger = logging.getLogger(__name__)
 
@@ -21,30 +22,6 @@ logger = logging.getLogger(__name__)
 def _now_ts() -> int:
     """Get current timestamp"""
     return int(time.time())
-
-
-def format_episodic_memory_entry(goal: str, action: str, observation: str, meta: dict) -> str:
-    """
-    Format an episodic memory entry in a human-readable format.
-    
-    Args:
-        goal: Task or goal description
-        action: Action that was executed
-        observation: Observation received
-        meta: Metadata dict with context (inventory, room, rewards, etc.)
-        
-    Returns:
-        Formatted memory string
-    """
-    return (
-        f"While working on the task: \"{goal}\",\n"
-        f"the action '{action}' caused: '{observation}'.\n"
-        f"Inventory: {meta.get('inventory_text', '')}\n"
-        f"Location: {meta.get('room', '')}\n"
-        f"Recent actions: {meta.get('recent_actions', [])}\n"
-        f"Recent obs: {meta.get('recent_obs', [])}\n"
-        f"Resulted in reward: {meta.get('reward')} (score {meta.get('score_prev')} → {meta.get('score_curr')})\n"
-    )
 
 
 def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, meta: dict = None) -> str:
@@ -98,10 +75,19 @@ def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, me
     # Set type based on classification result
     rec.type = primary
     
-    # Log with detailed info: action, primary, subtag, computed_reward, s_prev→s_curr
-    reward_val = rec.meta.get('reward', 0.0)
+    # Extract values for structured formatting
+    reward_val = rec.meta.get('reward', 0.0) or 0.0
     score_prev = rec.meta.get('score_prev')
     score_curr = rec.meta.get('score_curr')
+    room = rec.meta.get('room', '')
+    inventory_text = rec.meta.get('inventory_text', '')
+    recent_actions = rec.meta.get('recent_actions', [])
+    recent_obs = rec.meta.get('recent_obs', [])
+    
+    # Parse inventory text into items
+    inventory_items = _parse_inventory_text(inventory_text)
+    
+    # Log with detailed info: action, primary, subtag, computed_reward, s_prev→s_curr
     score_str = f"{score_prev} → {score_curr}" if (score_prev is not None and score_curr is not None) else "N/A"
     logger.info(
         f"[AMM Writer] Writing SUCCESS memory: "
@@ -109,21 +95,29 @@ def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, me
         f"reward={reward_val}, score={score_str}"
     )
     
-    # Format the memory content using the readable formatter
-    content = format_episodic_memory_entry(
-        goal=rec.goal_signature,
+    # Format the memory content using structured formatter (tags are embedded)
+    content = format_em_structured(
+        goal_text=rec.goal_signature,
+        room=room,
+        inventory_items=inventory_items,
         action=rec.action_text,
         observation=rec.obs_text,
-        meta=rec.meta
+        recent_actions=recent_actions,
+        recent_obs=recent_obs,
+        reward=reward_val,
+        score_prev=score_prev or 0.0,
+        score_curr=score_curr or 0.0,
+        primary_tag=primary,
+        subtag=subtag,
     )
     
-    # Append tags to content
-    content_with_tags = append_tags_to_content(content, primary, subtag)
+    # Build payload with only content (tags are already embedded in structured format)
+    payload = {"content": content}
     
-    # Build payload with only content (tags are embedded)
-    payload = {"content": content_with_tags}
-    
-    logger.info(f"[AMM Writer] Formatted content length: {len(content_with_tags)} chars, tags: {primary}" + (f", {subtag}" if subtag else ""))
+    # Log structured content preview (first 1-2 lines)
+    content_lines = content.split('\n')
+    preview = ' | '.join([line for line in content_lines[:2] if line.strip()])
+    logger.info(f"[AMM Writer] Formatted content length: {len(content)} chars, preview: {preview}")
     
     # TODO: Add de-dup hook (amm/dedup.py) in future phases
     return client.add_tagged(payload)
@@ -180,10 +174,19 @@ def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, m
     # Set type based on classification result
     rec.type = primary
     
-    # Log with detailed info: action, primary, subtag, computed_reward, s_prev→s_curr
-    reward_val = rec.meta.get('reward', 0.0)
+    # Extract values for structured formatting
+    reward_val = rec.meta.get('reward', 0.0) or 0.0
     score_prev = rec.meta.get('score_prev')
     score_curr = rec.meta.get('score_curr')
+    room = rec.meta.get('room', '')
+    inventory_text = rec.meta.get('inventory_text', '')
+    recent_actions = rec.meta.get('recent_actions', [])
+    recent_obs = rec.meta.get('recent_obs', [])
+    
+    # Parse inventory text into items
+    inventory_items = _parse_inventory_text(inventory_text)
+    
+    # Log with detailed info: action, primary, subtag, computed_reward, s_prev→s_curr
     score_str = f"{score_prev} → {score_curr}" if (score_prev is not None and score_curr is not None) else "N/A"
     logger.info(
         f"[AMM Writer] Writing NEARMISS memory: "
@@ -191,21 +194,29 @@ def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, m
         f"reward={reward_val}, score={score_str}"
     )
     
-    # Format the memory content using the readable formatter
-    content = format_episodic_memory_entry(
-        goal=rec.goal_signature,
+    # Format the memory content using structured formatter (tags are embedded)
+    content = format_em_structured(
+        goal_text=rec.goal_signature,
+        room=room,
+        inventory_items=inventory_items,
         action=rec.action_text,
         observation=rec.obs_text,
-        meta=rec.meta
+        recent_actions=recent_actions,
+        recent_obs=recent_obs,
+        reward=reward_val,
+        score_prev=score_prev or 0.0,
+        score_curr=score_curr or 0.0,
+        primary_tag=primary,
+        subtag=subtag,
     )
     
-    # Append tags to content
-    content_with_tags = append_tags_to_content(content, primary, subtag)
+    # Build payload with only content (tags are already embedded in structured format)
+    payload = {"content": content}
     
-    # Build payload with only content (tags are embedded)
-    payload = {"content": content_with_tags}
-    
-    logger.info(f"[AMM Writer] Formatted content length: {len(content_with_tags)} chars, tags: {primary}" + (f", {subtag}" if subtag else ""))
+    # Log structured content preview (first 1-2 lines)
+    content_lines = content.split('\n')
+    preview = ' | '.join([line for line in content_lines[:2] if line.strip()])
+    logger.info(f"[AMM Writer] Formatted content length: {len(content)} chars, preview: {preview}")
     
     return client.add_tagged(payload)
 
@@ -264,10 +275,19 @@ def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, 
     # Set type based on classification result
     rec.type = primary
     
-    # Log with detailed info: action, primary, subtag, computed_reward, s_prev→s_curr
-    reward_val = rec.meta.get('reward', 0.0)
+    # Extract values for structured formatting
+    reward_val = rec.meta.get('reward', 0.0) or 0.0
     score_prev = rec.meta.get('score_prev')
     score_curr = rec.meta.get('score_curr')
+    room = rec.meta.get('room', '')
+    inventory_text = rec.meta.get('inventory_text', '')
+    recent_actions = rec.meta.get('recent_actions', [])
+    recent_obs = rec.meta.get('recent_obs', [])
+    
+    # Parse inventory text into items
+    inventory_items = _parse_inventory_text(inventory_text)
+    
+    # Log with detailed info: action, primary, subtag, computed_reward, s_prev→s_curr
     score_str = f"{score_prev} → {score_curr}" if (score_prev is not None and score_curr is not None) else "N/A"
     logger.info(
         f"[AMM Writer] Writing AVOIDANCE memory: "
@@ -275,21 +295,29 @@ def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, 
         f"reward={reward_val}, score={score_str}"
     )
     
-    # Format the memory content using the readable formatter
-    content = format_episodic_memory_entry(
-        goal=rec.goal_signature,
+    # Format the memory content using structured formatter (tags are embedded)
+    content = format_em_structured(
+        goal_text=rec.goal_signature,
+        room=room,
+        inventory_items=inventory_items,
         action=rec.action_text,
         observation=rec.obs_text,
-        meta=rec.meta
+        recent_actions=recent_actions,
+        recent_obs=recent_obs,
+        reward=reward_val,
+        score_prev=score_prev or 0.0,
+        score_curr=score_curr or 0.0,
+        primary_tag=primary,
+        subtag=subtag,
     )
     
-    # Append tags to content
-    content_with_tags = append_tags_to_content(content, primary, subtag)
+    # Build payload with only content (tags are already embedded in structured format)
+    payload = {"content": content}
     
-    # Build payload with only content (tags are embedded)
-    payload = {"content": content_with_tags}
-    
-    logger.info(f"[AMM Writer] Formatted content length: {len(content_with_tags)} chars, tags: {primary}" + (f", {subtag}" if subtag else ""))
+    # Log structured content preview (first 1-2 lines)
+    content_lines = content.split('\n')
+    preview = ' | '.join([line for line in content_lines[:2] if line.strip()])
+    logger.info(f"[AMM Writer] Formatted content length: {len(content)} chars, preview: {preview}")
     
     return client.add_tagged(payload)
 
