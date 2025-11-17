@@ -568,6 +568,7 @@ def eval(args, task_num, logger):
                 ctx_meta = {
                     "room": current_place,
                     "inventory_text": inventory_str,
+                    "look": info['look'],  # Room description/look string
                     "recent_actions": recent_actions[-5:] if len(recent_actions) > 5 else recent_actions,
                     "recent_obs": [o[:100] for o in recent_obs[-5:]] if len(recent_obs) > 5 else [o[:100] for o in recent_obs],
                     "reward": reward_true,  # TRUE reward from environment

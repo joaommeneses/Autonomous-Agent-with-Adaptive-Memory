@@ -81,6 +81,7 @@ def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, me
     score_curr = rec.meta.get('score_curr')
     room = rec.meta.get('room', '')
     inventory_text = rec.meta.get('inventory_text', '')
+    look = rec.meta.get('look', '')
     recent_actions = rec.meta.get('recent_actions', [])
     recent_obs = rec.meta.get('recent_obs', [])
     
@@ -109,6 +110,7 @@ def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, me
         score_curr=score_curr or 0.0,
         primary_tag=primary,
         subtag=subtag,
+        look=look,
     )
     
     # Build payload with only content (tags are already embedded in structured format)
@@ -180,6 +182,7 @@ def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, m
     score_curr = rec.meta.get('score_curr')
     room = rec.meta.get('room', '')
     inventory_text = rec.meta.get('inventory_text', '')
+    look = rec.meta.get('look', '')
     recent_actions = rec.meta.get('recent_actions', [])
     recent_obs = rec.meta.get('recent_obs', [])
     
@@ -208,6 +211,7 @@ def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, m
         score_curr=score_curr or 0.0,
         primary_tag=primary,
         subtag=subtag,
+        look=look,
     )
     
     # Build payload with only content (tags are already embedded in structured format)
@@ -281,6 +285,7 @@ def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, 
     score_curr = rec.meta.get('score_curr')
     room = rec.meta.get('room', '')
     inventory_text = rec.meta.get('inventory_text', '')
+    look = rec.meta.get('look', '')
     recent_actions = rec.meta.get('recent_actions', [])
     recent_obs = rec.meta.get('recent_obs', [])
     
@@ -309,6 +314,7 @@ def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, 
         score_curr=score_curr or 0.0,
         primary_tag=primary,
         subtag=subtag,
+        look=look,
     )
     
     # Build payload with only content (tags are already embedded in structured format)

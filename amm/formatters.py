@@ -103,6 +103,7 @@ def format_em_structured(
     score_curr: float,
     primary_tag: str,
     subtag: Optional[str] = None,
+    look: Optional[str] = None,
 ) -> str:
     """
     Format episodic memory in canonical structured format.
@@ -120,6 +121,7 @@ def format_em_structured(
         score_curr: Current score (float)
         primary_tag: Primary tag (e.g., "episodic_success")
         subtag: Optional subtag (e.g., "milestone")
+        look: Optional room description/look string
         
     Returns:
         Formatted memory string with fielded structure
@@ -139,6 +141,16 @@ def format_em_structured(
     lines = [
         f'TASK: "{goal_text}"',
         f"STATE: room={room}; inventory=[{inv_str}]",
+    ]
+    
+    # Add LOOK line if provided
+    if look:
+        # Normalize look string (strip, but preserve structure)
+        look_str = look.strip() if look else ""
+        if look_str:
+            lines.append(f"LOOK: {look_str}")
+    
+    lines.extend([
         f"ACTION: {action}",
         f"OBSERVATION: {observation}",
         f"RECENT_ACTIONS: [{', '.join(ra)}]",
@@ -146,7 +158,7 @@ def format_em_structured(
         f"REWARD: {_fmt_signed_reward(reward)} ({_fmt_score(score_prev, score_curr)})",
         # WHY_REWARDED is intentionally omitted here; Letta will add it.
         f"TAGS: {tags}",
-    ]
+    ])
     
     return "\n".join(lines) + "\n"
 
