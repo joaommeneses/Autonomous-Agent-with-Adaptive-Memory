@@ -15,6 +15,7 @@ from .client_letta import AMMLettaClient, LettaConfig
 from .writer import write_success, write_nearmiss, write_avoidance
 from .config import AMMConfig, DEFAULT_CONFIG
 from .tagging import classify_episode, append_tags_to_content, validate_tags, TaggingError, is_eventful
+from .retrieval import build_success_retrieval_query_s1, retrieve_success_ems_s1
 
 __version__ = "0.1.0"
 __all__ = [
@@ -32,5 +33,7 @@ __all__ = [
     "append_tags_to_content",
     "validate_tags",
     "TaggingError",
-    "is_eventful"
+    "is_eventful",
+    "build_success_retrieval_query_s1",
+    "retrieve_success_ems_s1",
 ]

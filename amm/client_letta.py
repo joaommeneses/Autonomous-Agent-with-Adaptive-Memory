@@ -187,15 +187,44 @@ class AMMLettaClient:
             logger.exception(f"[AMM Letta] archival_memory_insert failed after retries: {e}")
             raise
     
-    def retrieve_memories(self, query: str, top_k: int = 20) -> List[Dict[str, Any]]:
+    def retrieve_memories(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """
-        Retrieve memories based on a query.
+        Retrieve memories based on a query using non-streaming messages.create API.
         
-        This will be implemented in Phase 2 for retrieval functionality.
-        For now, returns empty list.
+        This uses the archival_memory_search tool via non-streaming API for synchronous retrieval.
+        
+        Args:
+            query: Query string formatted for archival_memory_search tool
+            top_k: Maximum number of memories to retrieve (default: 10)
+            
+        Returns:
+            Response object from Letta API (contains messages with tool output)
         """
-        logger.info(f"[AMM Letta] Retrieval requested (not implemented in Phase 1): {query}")
-        return []
+        logger.info(f"[AMM Letta] Retrieval requested (non-streaming): query_len={len(query)}")
+        
+        if not self.agent_id:
+            raise RuntimeError("[AMM Letta] agent_id is not set; cannot retrieve memories.")
+        
+        def _retrieve():
+            # Use non-streaming messages.create API with messages parameter
+            response = self.client.agents.messages.create(
+                agent_id=self.agent_id,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": query,
+                    }
+                ],
+            )
+            return response
+        
+        try:
+            response = self._retry_with_backoff(_retrieve)
+            logger.info("[AMM Letta] Retrieval completed successfully")
+            return response
+        except Exception as e:
+            logger.exception(f"[AMM Letta] Retrieval failed after retries: {e}")
+            raise
     
     def _format_memory_for_storage(self, memory: Dict[str, Any]) -> str:
         """

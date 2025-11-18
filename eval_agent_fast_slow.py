@@ -460,7 +460,10 @@ def eval(args, task_num, logger):
                         useful_focus_on, focus_on_done, force_system_1, force_system_2,
                         gpt_version, llm=llm,
                         episodic_memories=None,  # AMM will handle memory retrieval in Phase 2
-                        use_memory_planning=use_memory_planning
+                        use_memory_planning=use_memory_planning,
+                        amm_client=amm_client,  # Pass AMM client for T1 retrieval
+                        current_score=score,  # Current score for retrieval query
+                        recent_scores=recent_scores  # Recent scores for retrieval query
                     )  
                     if not used_sys2:
                         action = return_result
