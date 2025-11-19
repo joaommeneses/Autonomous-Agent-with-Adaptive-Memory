@@ -34,7 +34,6 @@ def build_success_retrieval_query_s1(
         inventory_items: List of inventory item strings
         recent_rewards: Last up to 5 reward values
         current_score: Current score value
-        look_description: Last LOOK observation (room description)
         recent_actions: Last 5 actions (defaults to empty list)
         recent_observations: Last 5 observations (aligned with recent_actions, defaults to empty list)
         
@@ -63,20 +62,14 @@ def build_success_retrieval_query_s1(
     recent_actions_str = json.dumps(recent_actions_list)
     recent_obs_str = json.dumps(recent_obs_list)
     
-    # Format look description (escape quotes if needed)
-    look_str = look_description or "N/A"
-    # Escape quotes in look_str for safe JSON-like embedding
-    look_str = look_str.replace('"', '\\"')
-    
     # Escape quotes in task_description
     task_desc_escaped = task_description.replace('"', '\\"')
     
-    # Build the query following Template A, mode S1 format
+    # Build the query following Template A, mode S1 format (without LOOK attribute)
     query = f"""Use the base tool archival_memory_search with these args.
 query:
 TASK: "{task_desc_escaped}"
 STATE: room={room_name}; inventory=[{inventory_str}]; recent_reward={recent_reward_str}; current_score={current_score};
-LOOK: {look_str}
 ACTION_CONTEXT: "The agent is planning its next steps and wants examples of clearly successful strategies for similar tasks and states so it can choose the next action correctly. Retrieve memories that show correct subgoal completion or full task completion, rather than failures."
 RECENT_ACTIONS: {recent_actions_str}
 RECENT_OBS: {recent_obs_str}
