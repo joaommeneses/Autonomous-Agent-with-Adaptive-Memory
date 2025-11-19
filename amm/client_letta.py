@@ -165,22 +165,23 @@ class AMMLettaClient:
             raise RuntimeError("[AMM Letta] agent_id is not set; cannot send memory write.")
         
         def _send_tagged_memory():
-            # Send the tool invocation message
-            stream = self.client.agents.messages.create_stream(
+            # Using async write (messages.create_async) to speed up EM insertion; we won't wait for the run to finish.
+            # Send the tool invocation message asynchronously
+            run = self.client.agents.messages.create_async(
                 agent_id=self.agent_id,
                 messages=[MessageCreate(role="user", content=tool_cmd)]
             )
             
-            last_chunk = None
-            for chunk in stream:
-                last_chunk = chunk
-                logger.debug(f"[AMM Letta] stream chunk: {chunk}")
+            # Log the run ID for debugging (but don't wait for completion)
+            run_id = getattr(run, 'id', None) or (run.get('id') if isinstance(run, dict) else None)
+            if run_id:
+                logger.debug(f"[AMM Letta] Async write initiated, run_id={run_id}")
             
             return ""
         
         try:
             result = self._retry_with_backoff(_send_tagged_memory)
-            logger.info("[AMM Letta] Stream completed successfully")
+            logger.info("[AMM Letta] Async write request submitted successfully")
             return result
         
         except Exception as e:
