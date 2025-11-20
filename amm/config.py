@@ -17,6 +17,11 @@ class AMMConfig:
     agent_id: str = os.getenv("LETTA_AGENT_ID", "")
     api_token: str = os.getenv("LETTA_API_TOKEN", "")
     
+    # ==================== Feature Flags ====================
+    # Control flags for enabling/disabling EM operations (for testing)
+    enable_em_write: bool = True  # Set to False to disable episodic memory writing
+    enable_em_retrieval: bool = False  # Set to False to disable episodic memory retrieval
+    
     # ==================== Tagging Thresholds ====================
     # Thresholds for episodic memory classification (raw score deltas)
     MILESTONE_THRESHOLD: float = 20.0  # Reward >= this → episodic_success + milestone

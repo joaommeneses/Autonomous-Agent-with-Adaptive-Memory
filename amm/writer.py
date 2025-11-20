@@ -37,6 +37,11 @@ def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, me
     Returns:
         Memory ID
     """
+    # Check if EM writing is enabled
+    if not DEFAULT_CONFIG.enable_em_write:
+        logger.debug("[AMM Writer] EM writing is disabled (enable_em_write=False), skipping write_success")
+        return ""
+    
     rec.meta.setdefault("created_ts", _now_ts())
     rec.meta["last_seen_ts"] = rec.meta["created_ts"]
     
@@ -138,6 +143,11 @@ def write_nearmiss(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, m
     Returns:
         Memory ID
     """
+    # Check if EM writing is enabled
+    if not DEFAULT_CONFIG.enable_em_write:
+        logger.debug("[AMM Writer] EM writing is disabled (enable_em_write=False), skipping write_nearmiss")
+        return ""
+    
     rec.meta.setdefault("created_ts", _now_ts())
     rec.meta["last_seen_ts"] = rec.meta["created_ts"]
     
@@ -238,6 +248,11 @@ def write_avoidance(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, 
     Returns:
         Memory ID
     """
+    # Check if EM writing is enabled
+    if not DEFAULT_CONFIG.enable_em_write:
+        logger.debug("[AMM Writer] EM writing is disabled (enable_em_write=False), skipping write_avoidance")
+        return ""
+    
     rec.meta.setdefault("created_ts", _now_ts())
     rec.meta["last_seen_ts"] = rec.meta["created_ts"]
     
