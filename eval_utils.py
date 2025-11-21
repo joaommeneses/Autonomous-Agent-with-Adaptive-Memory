@@ -428,7 +428,8 @@ def findValidActionWithSystem2(
     demo_data, logger, sbert_model, step, last_time_system2_steps,
     useful_focus_on, focus_on_done, force_system_1, force_system_2,
     gpt_version="gemini-2.5-flash-preview-04-17", llm=None,
-    episodic_memories=None, use_memory_planning=True
+    episodic_memories=None, use_memory_planning=True,
+    amm_client=None, current_score=None, recent_scores=None
 ):
     inventory = env.inventory()
     validActions = getFilteredValidActions(env, look, task_id=task_id, task_desc=task_description)
@@ -448,6 +449,78 @@ def findValidActionWithSystem2(
             found_valid_in_top = True
             break
     logger.info(f"found_valid_in_top={found_valid_in_top} ({action})")
+
+    # === T1 TRIGGER: Episodic Memory Retrieval (Template A, S1) ===
+    # When Swift fails to find a valid action, retrieve success EMs
+    retrieved_ems = []
+    if not found_valid_in_top and amm_client is not None:
+        try:
+            from amm.retrieval import build_success_retrieval_query_s1, retrieve_success_ems_s1
+            from amm.formatters import _parse_inventory_text
+            from amm.config import DEFAULT_CONFIG
+            
+            # Check if EM retrieval is enabled
+            if not DEFAULT_CONFIG.enable_em_retrieval:
+                logger.debug("[T1 Trigger] EM retrieval is disabled (enable_em_retrieval=False), skipping retrieval")
+            else:
+                # Get current state for retrieval query
+                current_room = get_current_room(look) or "unknown"
+                inventory_text = env.inventory()
+                inventory_items = _parse_inventory_text(inventory_text)
+                
+                # Get recent rewards and scores (normalize to match expected format)
+                recent_rewards_window = recent_reward[-5:] if len(recent_reward) > 5 else recent_reward
+                recent_scores_window = recent_scores[-5:] if recent_scores and len(recent_scores) > 5 else (recent_scores or [])
+                current_score_val = current_score if current_score is not None else (recent_scores_window[-1] * 100 if recent_scores_window else 0.0)
+                
+                # Get recent actions and observations
+                recent_actions_window = recent_actions[-5:] if len(recent_actions) > 5 else recent_actions
+                recent_obs_window = recent_obs[-5:] if len(recent_obs) > 5 else recent_obs
+                
+                # Build retrieval query (Template A, S1)
+                query_text = build_success_retrieval_query_s1(
+                    task_description=task_description,
+                    room_name=current_room,
+                    inventory_items=inventory_items,
+                    recent_rewards=recent_rewards_window,
+                    current_score=current_score_val,
+                    look_description=look,
+                    recent_actions=recent_actions_window,
+                    recent_observations=recent_obs_window,
+                )
+                
+                # Retrieve episodic memories via Letta (non-streaming)
+                retrieved_ems = retrieve_success_ems_s1(
+                    memory_agent_id=amm_client.agent_id,
+                    query_text=query_text,
+                    letta_client=amm_client,
+                )
+                
+                logger.info(f"[T1 Trigger] Retrieved {len(retrieved_ems)} episodic memories for Swift failure")
+                
+                # TODO: Build augmented context for Swift with EMs (commented out for now)
+                # swift_context_with_ems = build_swift_context_with_episodic_memories(
+                #     base_context=base_swift_context_for_this_step,
+                #     episodic_memories=retrieved_ems,
+                # )
+                # 
+                # # Re-run Swift with EM-augmented context
+                # new_actions, new_found_valid_in_top = run_swift_with_context(
+                #     context=swift_context_with_ems,
+                #     ...
+                # )
+                # 
+                # if new_found_valid_in_top:
+                #     # Use this new valid action
+                #     ...
+                # else:
+                #     # Fall back to existing behavior
+                #     ...
+                
+        except Exception as e:
+            logger.warning(f"[T1 Trigger] Episodic memory retrieval failed: {e}")
+            retrieved_ems = []
+    # ================================================================
 
     last_sys2 = last_time_system2_steps[-1] if last_time_system2_steps else -999
     if found_valid_in_top and len(recent_actions) < 10:

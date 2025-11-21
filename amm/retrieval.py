@@ -38,7 +38,7 @@ def build_success_retrieval_query_s1(
         recent_observations: Last 5 observations (aligned with recent_actions, defaults to empty list)
         
     Returns:
-        Formatted query string for archival_memory_search tool
+        Formatted query string for passages.search (plain semantic query, no tool invocation)
     """
     # Normalize inputs
     recent_actions = recent_actions or []
@@ -66,9 +66,8 @@ def build_success_retrieval_query_s1(
     task_desc_escaped = task_description.replace('"', '\\"')
     
     # Build the query following Template A, mode S1 format (without LOOK attribute)
-    query = f"""Use the base tool archival_memory_search with these args.
-query:
-TASK: "{task_desc_escaped}"
+    # This is now used as a plain semantic query string for passages.search
+    query = f"""TASK: "{task_desc_escaped}"
 STATE: room={room_name}; inventory=[{inventory_str}]; recent_reward={recent_reward_str}; current_score={current_score};
 ACTION_CONTEXT: "The agent is planning its next steps and wants examples of clearly successful strategies for similar tasks and states so it can choose the next action correctly. Retrieve memories that show correct subgoal completion or full task completion, rather than failures."
 RECENT_ACTIONS: {recent_actions_str}
@@ -76,7 +75,6 @@ RECENT_OBS: {recent_obs_str}
 ISSUE: "swift_failure"
 TAG_SCOPE: subgoal_focus, terminal_task_completion
 TAGS_HINT: episodic_success
-limit: 10
 """
     
     return query
@@ -88,8 +86,8 @@ def retrieve_success_ems_s1(
     letta_client: Any,  # AMMLettaClient type
 ) -> List[Dict[str, Any]]:
     """
-    Send S1 retrieval query to Letta memory agent using non-streaming messages.create API,
-    and return a list of episodic memory dicts parsed from the archival_memory_search tool output.
+    Send S1 retrieval query to Letta memory agent using passages.search API,
+    and return a list of episodic memory passages.
     
     Args:
         memory_agent_id: Letta agent ID for memory operations (unused, kept for API compatibility)
@@ -97,31 +95,26 @@ def retrieve_success_ems_s1(
         letta_client: AMMLettaClient instance
         
     Returns:
-        List of episodic memory dictionaries (parsed from tool output)
+        List of episodic memory passage dictionaries (each has content, tags, timestamp, relevance)
         
     Raises:
-        Exception: If retrieval fails or parsing fails
+        Exception: If retrieval fails
     """
-    logger.info("[AMM Retrieval] Starting S1 retrieval (non-streaming)")
-    logger.debug(f"[AMM Retrieval] Query:\n{query_text[:500]}...")
+    logger.info("[AMM Retrieval] Starting S1 retrieval via passages.search")
+    logger.info(f"[AMM Retrieval] Query:\n{query_text}")
     
     try:
-        # Call Letta using non-streaming messages.create API via client method
-        response = letta_client.retrieve_memories(query_text, top_k=10)
+        # Call Letta using passages.search API via client method
+        passages = letta_client.retrieve_memories(query_text, top_k=10)
         
-        logger.info(f"[AMM Retrieval] Received response with {len(response.messages) if hasattr(response, 'messages') else 'unknown'} messages")
+        logger.info(f"[AMM Retrieval] Retrieved {len(passages)} episodic memory passages")
         
-        # Parse tool output from response
-        episodic_memories = _parse_archival_memory_search_output(response)
+        # Log retrieved passages in a clean format
+        for i, passage in enumerate(passages):
+            passage_preview = json.dumps(passage, indent=2)[:300] + "..." if len(json.dumps(passage)) > 300 else json.dumps(passage, indent=2)
+            logger.info(f"[AMM Retrieval] Passage {i+1}:\n{passage_preview}")
         
-        logger.info(f"[AMM Retrieval] Retrieved {len(episodic_memories)} episodic memories")
-        
-        # Log retrieved memories in a clean format
-        for i, em in enumerate(episodic_memories):  # Log all EMs
-            em_preview = json.dumps(em, indent=2)[:300] + "..." if len(json.dumps(em)) > 300 else json.dumps(em, indent=2)
-            logger.info(f"[AMM Retrieval] EM {i+1}:\n{em_preview}")
-        
-        return episodic_memories
+        return passages
         
     except Exception as e:
         logger.error(f"[AMM Retrieval] Retrieval failed: {e}")

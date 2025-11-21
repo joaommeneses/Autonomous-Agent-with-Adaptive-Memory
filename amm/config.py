@@ -20,7 +20,7 @@ class AMMConfig:
     # ==================== Feature Flags ====================
     # Control flags for enabling/disabling EM operations (for testing)
     enable_em_write: bool = True  # Set to False to disable episodic memory writing
-    enable_em_retrieval: bool = False  # Set to False to disable episodic memory retrieval
+    enable_em_retrieval: bool = True  # Set to False to disable episodic memory retrieval
     
     # ==================== Tagging Thresholds ====================
     # Thresholds for episodic memory classification (raw score deltas)
