@@ -141,7 +141,7 @@ ACTION_CONTEXT: "The agent is planning its next steps and wants examples of succ
 RECENT_ACTIONS: {recent_actions_str}
 RECENT_OBS: {recent_obs_str}
 ISSUE: "swift_failure"
-TAG_SCOPE: subgoal_focus, terminal_task_completion, partial_progress
+TAG_SCOPE: subgoal_focus, terminal_task_completion, partial
 TAGS_HINT: episodic_success, episodic_nearmiss
 """
     
