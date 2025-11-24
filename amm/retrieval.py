@@ -175,13 +175,6 @@ def retrieve_success_ems_s1(
         # Call Letta using passages.search API via client method
         passages = letta_client.retrieve_memories(query_text, top_k=10)
         
-        logger.info(f"[AMM Retrieval] Retrieved {len(passages)} episodic memory passages")
-        
-        # Log retrieved passages in a clean format
-        for i, passage in enumerate(passages):
-            passage_preview = json.dumps(passage, indent=2)[:300] + "..." if len(json.dumps(passage)) > 300 else json.dumps(passage, indent=2)
-            logger.info(f"[AMM Retrieval] Passage {i+1}:\n{passage_preview}")
-        
         return passages
         
     except Exception as e:
