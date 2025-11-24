@@ -429,7 +429,8 @@ def findValidActionWithSystem2(
     useful_focus_on, focus_on_done, force_system_1, force_system_2,
     gpt_version="gemini-2.5-flash-preview-04-17", llm=None,
     episodic_memories=None, use_memory_planning=True,
-    amm_client=None, current_score=None, recent_scores=None
+    amm_client=None, current_score=None, recent_scores=None,
+    swift_failure_count: int = 0
 ):
     inventory = env.inventory()
     validActions = getFilteredValidActions(env, look, task_id=task_id, task_desc=task_description)
@@ -450,12 +451,15 @@ def findValidActionWithSystem2(
             break
     logger.info(f"found_valid_in_top={found_valid_in_top} ({action})")
 
-    # === T1 TRIGGER: Episodic Memory Retrieval (Template A, S1) ===
-    # When Swift fails to find a valid action, retrieve success EMs
+    # === T1 TRIGGER: Episodic Memory Retrieval (Template A, S1 → S2 → Sage) ===
+    # When Swift fails to find a valid action, retrieve success EMs based on escalation level
     retrieved_ems = []
     if not found_valid_in_top and amm_client is not None:
         try:
-            from amm.retrieval import build_success_retrieval_query_s1, retrieve_success_ems_s1
+            from amm.retrieval import (
+                build_success_retrieval_query_s1, retrieve_success_ems_s1,
+                build_success_retrieval_query_s2, retrieve_success_ems_s2
+            )
             from amm.formatters import _parse_inventory_text
             from amm.config import DEFAULT_CONFIG
             
@@ -477,24 +481,46 @@ def findValidActionWithSystem2(
                 recent_actions_window = recent_actions[-5:] if len(recent_actions) > 5 else recent_actions
                 recent_obs_window = recent_obs[-5:] if len(recent_obs) > 5 else recent_obs
                 
-                # Build retrieval query (Template A, S1)
-                query_text = build_success_retrieval_query_s1(
-                    task_description=task_description,
-                    room_name=current_room,
-                    inventory_items=inventory_items,
-                    recent_rewards=recent_rewards_window,
-                    current_score=current_score_val,
-                    look_description=look,
-                    recent_actions=recent_actions_window,
-                    recent_observations=recent_obs_window,
-                )
-                
-                # Retrieve episodic memories via Letta (non-streaming)
-                retrieved_ems = retrieve_success_ems_s1(
-                    memory_agent_id=amm_client.agent_id,
-                    query_text=query_text,
-                    letta_client=amm_client,
-                )
+                # T1 Escalation Logic: S1 → S2 → Skip (let Sage handle)
+                if swift_failure_count == 0:
+                    logger.info("[T1 Trigger] First Swift failure (swift_failure_count=0) → Using S1 retrieval (success-only EMs)")
+                    query_text = build_success_retrieval_query_s1(
+                        task_description=task_description,
+                        room_name=current_room,
+                        inventory_items=inventory_items,
+                        recent_rewards=recent_rewards_window,
+                        current_score=current_score_val,
+                        look_description=look,
+                        recent_actions=recent_actions_window,
+                        recent_observations=recent_obs_window,
+                    )
+                    retrieved_ems = retrieve_success_ems_s1(
+                        memory_agent_id=amm_client.agent_id,
+                        query_text=query_text,
+                        letta_client=amm_client,
+                    )
+                elif swift_failure_count == 1:
+                    logger.info("[T1 Trigger] Second Swift failure (swift_failure_count=1) → Using S2 retrieval (success + partial/near-miss EMs)")
+                    query_text = build_success_retrieval_query_s2(
+                        task_description=task_description,
+                        room_name=current_room,
+                        inventory_items=inventory_items,
+                        recent_rewards=recent_rewards_window,
+                        current_score=current_score_val,
+                        look_description=look,
+                        recent_actions=recent_actions_window,
+                        recent_observations=recent_obs_window,
+                    )
+                    retrieved_ems = retrieve_success_ems_s2(
+                        memory_agent_id=amm_client.agent_id,
+                        query_text=query_text,
+                        letta_client=amm_client,
+                    )
+                else:  # swift_failure_count >= 2
+                    logger.info(
+                        f"[T1 Trigger] Skipping AMM retrieval; swift_failure_count={swift_failure_count} "
+                        "→ will fall back to existing Sage escalation logic."
+                    )
                 
                 logger.info(f"[T1 Trigger] Retrieved {len(retrieved_ems)} episodic memories for Swift failure")
                 

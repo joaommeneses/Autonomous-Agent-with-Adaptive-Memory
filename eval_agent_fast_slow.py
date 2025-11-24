@@ -224,6 +224,7 @@ def eval(args, task_num, logger):
         no_action_done = 0
         system_2_focused = False
         system_1_focused_trial = 0
+        swift_failure_count = 0
         pattern = r"focus on\s+(\b\w+\b(\s+\b\w+\b)*)"
         matches = re.findall(pattern, task_description)
         to_focus = [match[0].replace("the ", " ").strip() for match in matches]
@@ -463,7 +464,8 @@ def eval(args, task_num, logger):
                         use_memory_planning=use_memory_planning,
                         amm_client=amm_client,  # Pass AMM client for T1 retrieval
                         current_score=score,  # Current score for retrieval query
-                        recent_scores=recent_scores  # Recent scores for retrieval query
+                        recent_scores=recent_scores,  # Recent scores for retrieval query
+                        swift_failure_count=swift_failure_count  # Pass swift_failure_count for T1 escalation
                     )  
                     if not used_sys2:
                         action = return_result
@@ -550,6 +552,10 @@ def eval(args, task_num, logger):
             no_action_done = 0
             prev_action = action
             recent_reward.append(reward_true/100)
+            if reward_true == 0.0:
+                swift_failure_count += 1
+            else:
+                swift_failure_count = 0
             recent_scores.append(score_true/100)
             recent_actions.append(action) 
             recent_obs.append(obs)
