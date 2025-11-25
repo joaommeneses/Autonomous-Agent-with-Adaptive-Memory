@@ -148,6 +148,148 @@ TAGS_HINT: episodic_success, episodic_nearmiss
     return query
 
 
+def build_stagnation_retrieval_query_s1(
+    task_description: str,
+    room_name: str,
+    inventory_items: List[str],
+    recent_rewards: List[float],
+    current_score: float,
+    look_description: Optional[str] = None,
+    recent_actions: List[str] = None,
+    recent_observations: List[str] = None,
+    cycles_without_progress: int = 0,
+) -> str:
+    """
+    Build a Template A (S1) retrieval query for stagnation-triggered episodic memory retrieval.
+    
+    This query is used when the agent has made no progress for several steps (T2 trigger).
+    It retrieves success-only memories to help break out of stagnation.
+    
+    Args:
+        task_description: Natural language task description
+        room_name: Current room/location name
+        inventory_items: List of inventory item strings
+        recent_rewards: Last up to 5 reward values
+        current_score: Current score value
+        look_description: Current look description (optional, kept for API compatibility)
+        recent_actions: Last 5 actions (defaults to empty list)
+        recent_observations: Last 5 observations (aligned with recent_actions, defaults to empty list)
+        cycles_without_progress: Number of steps without progress (for context in ACTION_CONTEXT)
+        
+    Returns:
+        Formatted query string for passages.search (plain semantic query, no tool invocation)
+    """
+    # Normalize inputs
+    recent_actions = recent_actions or []
+    recent_observations = recent_observations or []
+    
+    # Format inventory as comma-separated string
+    inventory_str = ", ".join(inventory_items) if inventory_items else ""
+    
+    # Format recent rewards as Python list literal
+    recent_reward_list = recent_rewards[-5:] if len(recent_rewards) > 5 else recent_rewards
+    recent_reward_str = json.dumps(recent_reward_list)
+    
+    # Format recent actions and observations as Python list literals
+    recent_actions_list = recent_actions[-5:] if len(recent_actions) > 5 else recent_actions
+    recent_obs_list = recent_observations[-5:] if len(recent_observations) > 5 else recent_observations
+    
+    # Ensure lists are aligned (pad with "N/A" if needed)
+    while len(recent_obs_list) < len(recent_actions_list):
+        recent_obs_list.append("N/A")
+    
+    recent_actions_str = json.dumps(recent_actions_list)
+    recent_obs_str = json.dumps(recent_obs_list)
+    
+    # Escape quotes in task_description
+    task_desc_escaped = task_description.replace('"', '\\"')
+    
+    # Build the query following Template A, mode S1 format (stagnation variant)
+    # This is now used as a plain semantic query string for passages.search
+    query = f"""TASK: "{task_desc_escaped}"
+STATE: room={room_name}; inventory=[{inventory_str}]; recent_reward={recent_reward_str}; current_score={current_score};
+ACTION_CONTEXT: "The agent's score has not improved for {cycles_without_progress} steps and it wants examples of strategies that break out of this lack of progress. Retrieve memories that show clearly successful strategies for similar tasks and states."
+RECENT_ACTIONS: {recent_actions_str}
+RECENT_OBS: {recent_obs_str}
+ISSUE: "stagnation_no_progress"
+TAG_SCOPE: subgoal_focus, terminal_task_completion
+TAGS_HINT: episodic_success
+"""
+    
+    return query
+
+
+def build_stagnation_retrieval_query_s2(
+    task_description: str,
+    room_name: str,
+    inventory_items: List[str],
+    recent_rewards: List[float],
+    current_score: float,
+    look_description: Optional[str] = None,
+    recent_actions: List[str] = None,
+    recent_observations: List[str] = None,
+    cycles_without_progress: int = 0,
+) -> str:
+    """
+    Build a Template A (S2) retrieval query for stagnation-triggered episodic memory retrieval.
+    
+    This query is used when the agent has made no progress for many steps (T2 trigger, S2 level).
+    It retrieves success + partial/near-miss memories to help break out of stagnation.
+    
+    Args:
+        task_description: Natural language task description
+        room_name: Current room/location name
+        inventory_items: List of inventory item strings
+        recent_rewards: Last up to 5 reward values
+        current_score: Current score value
+        look_description: Current look description (optional, kept for API compatibility)
+        recent_actions: Last 5 actions (defaults to empty list)
+        recent_observations: Last 5 observations (aligned with recent_actions, defaults to empty list)
+        cycles_without_progress: Number of steps without progress (for context in ACTION_CONTEXT)
+        
+    Returns:
+        Formatted query string for passages.search (plain semantic query, no tool invocation)
+    """
+    # Normalize inputs
+    recent_actions = recent_actions or []
+    recent_observations = recent_observations or []
+    
+    # Format inventory as comma-separated string
+    inventory_str = ", ".join(inventory_items) if inventory_items else ""
+    
+    # Format recent rewards as Python list literal
+    recent_reward_list = recent_rewards[-5:] if len(recent_rewards) > 5 else recent_rewards
+    recent_reward_str = json.dumps(recent_reward_list)
+    
+    # Format recent actions and observations as Python list literals
+    recent_actions_list = recent_actions[-5:] if len(recent_actions) > 5 else recent_actions
+    recent_obs_list = recent_observations[-5:] if len(recent_observations) > 5 else recent_observations
+    
+    # Ensure lists are aligned (pad with "N/A" if needed)
+    while len(recent_obs_list) < len(recent_actions_list):
+        recent_obs_list.append("N/A")
+    
+    recent_actions_str = json.dumps(recent_actions_list)
+    recent_obs_str = json.dumps(recent_obs_list)
+    
+    # Escape quotes in task_description
+    task_desc_escaped = task_description.replace('"', '\\"')
+    
+    # Build the query following Template A, mode S2 format (stagnation variant)
+    # This is now used as a plain semantic query string for passages.search
+    query = f"""TASK: "{task_desc_escaped}"
+STATE: room={room_name}; inventory=[{inventory_str}]; recent_reward={recent_reward_str}; current_score={current_score};
+ACTION_CONTEXT: "The agent's score has not improved for {cycles_without_progress} steps and it wants examples of strategies that break out of this lack of progress. Retrieve memories that show successful strategies OR partial progress (near-miss) for similar tasks and states."
+RECENT_ACTIONS: {recent_actions_str}
+RECENT_OBS: {recent_obs_str}
+ISSUE: "stagnation_no_progress"
+TAG_SCOPE: subgoal_focus, terminal_task_completion, partial
+TAGS_HINT: episodic_success, episodic_nearmiss
+"""
+    
+    return query
+
+
 def retrieve_success_ems_s1(
     memory_agent_id: str,
     query_text: str,

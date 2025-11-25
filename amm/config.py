@@ -21,6 +21,12 @@ class AMMConfig:
     # Control flags for enabling/disabling EM operations (for testing)
     enable_em_write: bool = True  # Set to False to disable episodic memory writing
     enable_em_retrieval: bool = True  # Set to False to disable episodic memory retrieval
+    enable_t2_retrieval: bool = True  # Set to False to disable T2 (stagnation) retrieval
+    
+    # ==================== T2 Stagnation Thresholds ====================
+    # Thresholds for T2 (stagnation/lack of progress) retrieval triggers
+    T2_STAGNATION_THRESHOLD_S1: int = 4  # Fire T2-S1 when cycles_without_progress == this value
+    T2_STAGNATION_THRESHOLD_S2: int = 8  # Fire T2-S2 when cycles_without_progress == this value
     
     # ==================== Tagging Thresholds ====================
     # Thresholds for episodic memory classification (raw score deltas)

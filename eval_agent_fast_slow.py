@@ -465,7 +465,18 @@ def eval(args, task_num, logger):
                         amm_client=amm_client,  # Pass AMM client for T1 retrieval
                         current_score=score,  # Current score for retrieval query
                         recent_scores=recent_scores,  # Recent scores for retrieval query
-                        swift_failure_count=swift_failure_count  # Pass swift_failure_count for T1 escalation
+                        swift_failure_count=swift_failure_count,  # Pass swift_failure_count for T1 escalation
+                        cycles_without_progress=wm.cycles_without_progress,  # Pass cycles_without_progress for T2 escalation
+                        # Parameters for second Swift pass (T1-S2 retry)
+                        args=args,
+                        tokenizer=tokenizer,
+                        lm_model=lm_model,
+                        device=device,
+                        compose_instance=compose_instance,
+                        prev_action=prev_action,
+                        prev_obs=prev_obs,
+                        objects=objects,
+                        places=places
                     )  
                     if not used_sys2:
                         action = return_result

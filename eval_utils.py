@@ -422,6 +422,168 @@ def try_to_replace(action, validActions, look=None, inventory=None):
 
 import openai  # make sure this is at the top of the file
 
+def rerun_swift_with_same_context(
+    task_description: str,
+    look: str,
+    inventory: str,
+    recent_actions: list,
+    recent_obs: list,
+    recent_locs: list,
+    recent_looks: dict,
+    failed_messages: list,
+    logger,
+    sbert_model,
+    step: int,
+    validActions: list,
+    args: dict,
+    tokenizer,
+    lm_model,
+    device,
+    compose_instance,
+    prev_action: str,
+    prev_obs: str,
+    objects: list,
+    places: list,
+    current_score: float,
+    retrieved_ems: list = None,  # For future use when we inject EMs into prompt
+) -> tuple:
+    """Re-run the fast agent (Swift) once more and try to get a valid action.
+    
+    This helper rebuilds the Swift input context and calls the model again,
+    then checks if any of the top predictions are valid actions.
+    
+    Args:
+        task_description: Current task description
+        look: Current room look description
+        inventory: Current inventory string
+        recent_actions: Recent action history
+        recent_obs: Recent observation history
+        recent_locs: Recent location history
+        recent_looks: Recent look descriptions by location
+        failed_messages: List of failed action messages
+        logger: Logger instance
+        sbert_model: SBERT model (not used in this helper but kept for signature consistency)
+        step: Current step number
+        validActions: List of valid actions for current state
+        args: Arguments dict (needs 'mode', 'max_input_len', 'beams')
+        tokenizer: Tokenizer for Swift model
+        lm_model: Swift model (Flan-T5)
+        device: Device for model inference
+        compose_instance: Function to compose input string (compose_instance_v4)
+        prev_action: Previous action string
+        prev_obs: Previous observation string
+        objects: List of objects seen
+        places: List of places visited
+        current_score: Current score (for returns_to_go calculation)
+        retrieved_ems: List of retrieved episodic memories (for future EM injection)
+    
+    Returns:
+        (action, found_valid_in_top) where:
+        - action: The selected action (None if no valid action found)
+        - found_valid_in_top: Boolean indicating if a valid action was found in top predictions
+    """
+    # TODO: In future, prepend a "Past Episodes" or EM block to the input_str here
+    # using retrieved_ems. For now, we rebuild the same context as the original Swift call.
+    
+    # Calculate returns_to_go (same logic as main loop)
+    returns_to_go = 1.0 - float(current_score) * 0.01
+    returns_to_go = round(returns_to_go, 2)
+    
+    # Get mode from args
+    mode = args.get("mode", "fast_system")
+    
+    # Clean history (same as main loop)
+    recent_scores = [0.0] * len(recent_actions)  # Placeholder, not used in compose_instance
+    recent_reward = [0.0] * len(recent_actions)  # Placeholder, not used in compose_instance
+    clean_recent_actions, clean_recent_obs, clean_recent_scores, clean_reward_clean, _ = \
+        clean_history(recent_actions, recent_obs, recent_scores, recent_reward, recent_locs)
+    
+    # Build input string using same compose_instance as main loop
+    input_str, _ = compose_instance(
+        mode=mode,
+        step_id=step + 1,
+        task_desc=task_description,
+        returns_to_go=returns_to_go,
+        curr_action=None,
+        curr_obs="",  # Current obs not needed for this context
+        inventory=inventory,
+        look=look,
+        prev_action=prev_action,
+        prev_obs=prev_obs,
+        objects=objects,
+        places=places,
+        recent_actions=clean_recent_actions,
+        recent_obs=clean_recent_obs,
+        recent_scores=clean_recent_scores,
+        recent_reward=clean_reward_clean
+    )
+    
+    # Sanitize input string (same as main loop)
+    from data_utils.data_utils import sanitizeStr
+    input_str = sanitizeStr(input_str)
+    
+    logger.info("[T1 Trigger] Second Swift pass - InputStr: " + input_str[:200] + "...")
+    
+    # Call Swift model to get predictions
+    predStrs = get_model_output(args, input_str, tokenizer, lm_model, device, logger)
+    
+    # Apply same valid action selection logic as original Swift check
+    found_valid_in_top = False
+    action = None
+    
+    # Filter out "wait" if last action was "wait" and first prediction is "wait"
+    if recent_actions and predStrs and recent_actions[-1].startswith("wait") and predStrs[0].startswith("wait"):
+        predStrs = predStrs[1:]
+    
+    # Try top prediction
+    for pred in predStrs[:1]:
+        pred = try_to_replace(pred, validActions, look, inventory)
+        action = pred.strip()
+        if pred.strip() in validActions:
+            found_valid_in_top = True
+            break
+    
+    logger.info(f"[T1 Trigger] Second Swift pass - found_valid_in_top={found_valid_in_top} ({action})")
+    
+    return action, found_valid_in_top
+
+
+def _build_retrieval_state(
+    env, look, recent_reward, recent_scores, current_score,
+    recent_actions, recent_obs
+):
+    """
+    Helper function to build shared state for T1 and T2 retrieval queries.
+    
+    Returns:
+        dict with keys: current_room, inventory_items, recent_rewards_window,
+        current_score_val, recent_actions_window, recent_obs_window
+    """
+    from amm.formatters import _parse_inventory_text
+    
+    current_room = get_current_room(look) or "unknown"
+    inventory_text = env.inventory()
+    inventory_items = _parse_inventory_text(inventory_text)
+    
+    # Get recent rewards and scores (normalize to match expected format)
+    recent_rewards_window = recent_reward[-5:] if len(recent_reward) > 5 else recent_reward
+    recent_scores_window = recent_scores[-5:] if recent_scores and len(recent_scores) > 5 else (recent_scores or [])
+    current_score_val = current_score if current_score is not None else (recent_scores_window[-1] * 100 if recent_scores_window else 0.0)
+    
+    # Get recent actions and observations
+    recent_actions_window = recent_actions[-5:] if len(recent_actions) > 5 else recent_actions
+    recent_obs_window = recent_obs[-5:] if len(recent_obs) > 5 else recent_obs
+    
+    return {
+        "current_room": current_room,
+        "inventory_items": inventory_items,
+        "recent_rewards_window": recent_rewards_window,
+        "current_score_val": current_score_val,
+        "recent_actions_window": recent_actions_window,
+        "recent_obs_window": recent_obs_window,
+    }
+
+
 def findValidActionWithSystem2(
     predictions, env, task_id, task_description, look,
     recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
@@ -430,7 +592,12 @@ def findValidActionWithSystem2(
     gpt_version="gemini-2.5-flash-preview-04-17", llm=None,
     episodic_memories=None, use_memory_planning=True,
     amm_client=None, current_score=None, recent_scores=None,
-    swift_failure_count: int = 0
+    swift_failure_count: int = 0,
+    cycles_without_progress: int = 0,  # For T2 (stagnation) trigger
+    # Parameters for second Swift pass (T1-S2 retry)
+    args=None, tokenizer=None, lm_model=None, device=None,
+    compose_instance=None, prev_action=None, prev_obs=None,
+    objects=None, places=None
 ):
     inventory = env.inventory()
     validActions = getFilteredValidActions(env, look, task_id=task_id, task_desc=task_description)
@@ -467,19 +634,17 @@ def findValidActionWithSystem2(
             if not DEFAULT_CONFIG.enable_em_retrieval:
                 logger.debug("[T1 Trigger] EM retrieval is disabled (enable_em_retrieval=False), skipping retrieval")
             else:
-                # Get current state for retrieval query
-                current_room = get_current_room(look) or "unknown"
-                inventory_text = env.inventory()
-                inventory_items = _parse_inventory_text(inventory_text)
-                
-                # Get recent rewards and scores (normalize to match expected format)
-                recent_rewards_window = recent_reward[-5:] if len(recent_reward) > 5 else recent_reward
-                recent_scores_window = recent_scores[-5:] if recent_scores and len(recent_scores) > 5 else (recent_scores or [])
-                current_score_val = current_score if current_score is not None else (recent_scores_window[-1] * 100 if recent_scores_window else 0.0)
-                
-                # Get recent actions and observations
-                recent_actions_window = recent_actions[-5:] if len(recent_actions) > 5 else recent_actions
-                recent_obs_window = recent_obs[-5:] if len(recent_obs) > 5 else recent_obs
+                # Build shared state for retrieval queries
+                retrieval_state = _build_retrieval_state(
+                    env, look, recent_reward, recent_scores, current_score,
+                    recent_actions, recent_obs
+                )
+                current_room = retrieval_state["current_room"]
+                inventory_items = retrieval_state["inventory_items"]
+                recent_rewards_window = retrieval_state["recent_rewards_window"]
+                current_score_val = retrieval_state["current_score_val"]
+                recent_actions_window = retrieval_state["recent_actions_window"]
+                recent_obs_window = retrieval_state["recent_obs_window"]
                 
                 # T1 Escalation Logic: S1 → S2 → Skip (let Sage handle)
                 if swift_failure_count == 0:
@@ -516,6 +681,45 @@ def findValidActionWithSystem2(
                         query_text=query_text,
                         letta_client=amm_client,
                     )
+                    
+                    # After S2 retrieval, attempt one more Swift pass before escalating to Sage
+                    if retrieved_ems and args is not None and tokenizer is not None and lm_model is not None and device is not None and compose_instance is not None:
+                        logger.info("[T1 Trigger] Re-running Swift once after S2 retrieval before escalating to System 2")
+                        second_action, second_found_valid = rerun_swift_with_same_context(
+                            task_description=task_description,
+                            look=look,
+                            inventory=inventory,
+                            recent_actions=recent_actions,
+                            recent_obs=recent_obs,
+                            recent_locs=recent_locs,
+                            recent_looks=recent_looks,
+                            failed_messages=failed_messages,
+                            logger=logger,
+                            sbert_model=sbert_model,
+                            step=step,
+                            validActions=validActions,
+                            args=args,
+                            tokenizer=tokenizer,
+                            lm_model=lm_model,
+                            device=device,
+                            compose_instance=compose_instance,
+                            prev_action=prev_action if prev_action is not None else "",
+                            prev_obs=prev_obs if prev_obs is not None else "",
+                            objects=objects if objects is not None else [],
+                            places=places if places is not None else [],
+                            current_score=current_score_val,
+                            retrieved_ems=retrieved_ems,  # Pass EMs for future use
+                        )
+                        
+                        if second_found_valid and second_action is not None:
+                            logger.info("[T1 Trigger] Second Swift attempt after S2 retrieval succeeded → using fast action, skipping System 2")
+                            return False, second_action
+                        else:
+                            logger.info("[T1 Trigger] Second Swift attempt still has no valid action → falling back to existing System 2 logic")
+                    elif not retrieved_ems:
+                        logger.info("[T1 Trigger] S2 retrieval returned no EMs, skipping second Swift pass → falling back to existing System 2 logic")
+                    else:
+                        logger.debug("[T1 Trigger] Missing Swift model parameters, skipping second Swift pass → falling back to existing System 2 logic")
                 else:  # swift_failure_count >= 2
                     logger.info(
                         f"[T1 Trigger] Skipping AMM retrieval; swift_failure_count={swift_failure_count} "
@@ -546,6 +750,95 @@ def findValidActionWithSystem2(
         except Exception as e:
             logger.warning(f"[T1 Trigger] Episodic memory retrieval failed: {e}")
             retrieved_ems = []
+    # ================================================================
+
+    # === T2 TRIGGER: Stagnation / Lack of Progress Retrieval ===
+    # When Swift succeeds but agent has made no progress for several steps
+    # T2 is mutually exclusive with T1 (only runs when found_valid_in_top == True)
+    t2_retrieved_ems = []
+    if found_valid_in_top and amm_client is not None:
+        try:
+            from amm.config import DEFAULT_CONFIG
+            from amm.retrieval import (
+                build_stagnation_retrieval_query_s1,
+                build_stagnation_retrieval_query_s2,
+                retrieve_success_ems_s1,
+                retrieve_success_ems_s2,
+            )
+            from amm.formatters import _parse_inventory_text
+            
+            # Check if EM retrieval and T2 are enabled
+            if DEFAULT_CONFIG.enable_em_retrieval and getattr(DEFAULT_CONFIG, "enable_t2_retrieval", True):
+                # Build shared state for retrieval queries (reuse helper)
+                retrieval_state = _build_retrieval_state(
+                    env, look, recent_reward, recent_scores, current_score,
+                    recent_actions, recent_obs
+                )
+                current_room = retrieval_state["current_room"]
+                inventory_items = retrieval_state["inventory_items"]
+                recent_rewards_window = retrieval_state["recent_rewards_window"]
+                current_score_val = retrieval_state["current_score_val"]
+                recent_actions_window = retrieval_state["recent_actions_window"]
+                recent_obs_window = retrieval_state["recent_obs_window"]
+                
+                # Use cycles_without_progress passed in
+                stagnation = cycles_without_progress or 0
+                
+                # T2 Escalation Logic: S1 → S2 (based on stagnation threshold)
+                if stagnation == DEFAULT_CONFIG.T2_STAGNATION_THRESHOLD_S1:
+                    logger.info(
+                        f"[T2 Trigger] Stagnation detected (cycles_without_progress={stagnation}) "
+                        "→ Using S1 retrieval (success-only EMs)"
+                    )
+                    # Build and retrieve S1
+                    query_text = build_stagnation_retrieval_query_s1(
+                        task_description=task_description,
+                        room_name=current_room,
+                        inventory_items=inventory_items,
+                        recent_rewards=recent_rewards_window,
+                        current_score=current_score_val,
+                        look_description=look,
+                        recent_actions=recent_actions_window,
+                        recent_observations=recent_obs_window,
+                        cycles_without_progress=stagnation,
+                    )
+                    t2_retrieved_ems = retrieve_success_ems_s1(
+                        memory_agent_id=amm_client.agent_id,
+                        query_text=query_text,
+                        letta_client=amm_client,
+                    )
+                    
+                elif stagnation == DEFAULT_CONFIG.T2_STAGNATION_THRESHOLD_S2:
+                    logger.info(
+                        f"[T2 Trigger] Stagnation persists (cycles_without_progress={stagnation}) "
+                        "→ Using S2 retrieval (success + near-miss EMs)"
+                    )
+                    # Build and retrieve S2
+                    query_text = build_stagnation_retrieval_query_s2(
+                        task_description=task_description,
+                        room_name=current_room,
+                        inventory_items=inventory_items,
+                        recent_rewards=recent_rewards_window,
+                        current_score=current_score_val,
+                        look_description=look,
+                        recent_actions=recent_actions_window,
+                        recent_observations=recent_obs_window,
+                        cycles_without_progress=stagnation,
+                    )
+                    t2_retrieved_ems = retrieve_success_ems_s2(
+                        memory_agent_id=amm_client.agent_id,
+                        query_text=query_text,
+                        letta_client=amm_client,
+                    )
+                
+                if t2_retrieved_ems:
+                    logger.info(f"[T2 Trigger] Retrieved {len(t2_retrieved_ems)} episodic memories for stagnation")
+                    # TODO: Later merge t2_retrieved_ems with other EMs for Sage planning
+                    # For now, T2 only retrieves and logs EMs; wiring into prompts comes in T4
+                    
+        except Exception as e:
+            logger.warning(f"[T2 Trigger] Episodic memory retrieval failed: {e}")
+            t2_retrieved_ems = []
     # ================================================================
 
     last_sys2 = last_time_system2_steps[-1] if last_time_system2_steps else -999
