@@ -67,6 +67,9 @@ class WorkingMemory:
     # Retrieval tracking (for future phases)
     last_retrieved_ids: List[str] = field(default_factory=list)
     
+    # T3 avoidance memories (stored when repeated invalid action detected)
+    avoidance_memories: List[Dict[str, Any]] = field(default_factory=list)
+    
     def reset(self):
         """Reset all fields to initial state"""
         self.__init__()
@@ -144,6 +147,14 @@ class WorkingMemory:
         """Set the difficulty score (0.0 to 1.0)"""
         self.difficulty_score = max(0.0, min(1.0, score))
     
+    def set_avoidance_memories(self, memories: List[Dict[str, Any]]) -> None:
+        """Set avoidance episodic memories (T3 trigger)"""
+        self.avoidance_memories = _safe_copy(memories)
+    
+    def clear_avoidance_memories(self) -> None:
+        """Clear avoidance episodic memories"""
+        self.avoidance_memories = []
+    
     def to_dict(self) -> dict:
         """Convert to dictionary for debugging/logging"""
         return {
@@ -159,5 +170,6 @@ class WorkingMemory:
             "cycles_without_progress": self.cycles_without_progress,
             "difficulty_score": self.difficulty_score,
             "last_progress_ts": self.last_progress_ts,
-            "last_retrieved_ids": self.last_retrieved_ids
+            "last_retrieved_ids": self.last_retrieved_ids,
+            "avoidance_memories": self.avoidance_memories
         }

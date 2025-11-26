@@ -290,6 +290,75 @@ TAGS_HINT: episodic_success, episodic_nearmiss
     return query
 
 
+def build_avoidance_retrieval_query_b(
+    task_description: str,
+    room_name: str,
+    inventory_items: List[str],
+    recent_rewards: List[float],
+    current_score: float,
+    look_description: Optional[str] = None,
+    recent_actions: List[str] = None,
+    recent_observations: List[str] = None,
+) -> str:
+    """
+    Build a Template B (avoidance) retrieval query for repeated invalid action scenarios.
+    
+    This query is used when the agent has repeated an invalid or clearly harmful action (T3 trigger).
+    It retrieves memories that warn against this pattern and show better alternative strategies.
+    
+    Args:
+        task_description: Natural language task description
+        room_name: Current room/location name
+        inventory_items: List of inventory item strings
+        recent_rewards: Last up to 5 reward values
+        current_score: Current score value
+        look_description: Current look description (optional, kept for API compatibility)
+        recent_actions: Last 5 actions (defaults to empty list)
+        recent_observations: Last 5 observations (aligned with recent_actions, defaults to empty list)
+        
+    Returns:
+        Formatted query string for passages.search (plain semantic query, no tool invocation)
+    """
+    # Normalize inputs
+    recent_actions = recent_actions or []
+    recent_observations = recent_observations or []
+    
+    # Format inventory as comma-separated string
+    inventory_str = ", ".join(inventory_items) if inventory_items else ""
+    
+    # Format recent rewards as Python list literal
+    recent_reward_list = recent_rewards[-5:] if len(recent_rewards) > 5 else recent_rewards
+    recent_reward_str = json.dumps(recent_reward_list)
+    
+    # Format recent actions and observations as Python list literals
+    recent_actions_list = recent_actions[-5:] if len(recent_actions) > 5 else recent_actions
+    recent_obs_list = recent_observations[-5:] if len(recent_observations) > 5 else recent_observations
+    
+    # Ensure lists are aligned (pad with "N/A" if needed)
+    while len(recent_obs_list) < len(recent_actions_list):
+        recent_obs_list.append("N/A")
+    
+    recent_actions_str = json.dumps(recent_actions_list)
+    recent_obs_str = json.dumps(recent_obs_list)
+    
+    # Escape quotes in task_description
+    task_desc_escaped = task_description.replace('"', '\\"')
+    
+    # Build the query following Template B format (avoidance)
+    # This is now used as a plain semantic query string for passages.search
+    query = f"""TASK: "{task_desc_escaped}"
+STATE: room={room_name}; inventory=[{inventory_str}]; recent_reward={recent_reward_str}; current_score={current_score};
+ACTION_CONTEXT: "The agent has just repeated an invalid or clearly harmful action; retrieve memories that warn against this pattern and show better alternative strategies."
+RECENT_ACTIONS: {recent_actions_str}
+RECENT_OBS: {recent_obs_str}
+ISSUE: "repeated_invalid_action"
+TAG_SCOPE: avoidance, failure_pattern
+TAGS_HINT: episodic_failure, episodic_nearmiss
+"""
+    
+    return query
+
+
 def retrieve_success_ems_s1(
     memory_agent_id: str,
     query_text: str,
@@ -362,6 +431,47 @@ def retrieve_success_ems_s2(
         
     except Exception as e:
         logger.error(f"[AMM Retrieval] S2 retrieval failed: {e}")
+        raise
+
+
+def retrieve_avoidance_ems_b(
+    memory_agent_id: str,
+    query_text: str,
+    letta_client: Any,  # AMMLettaClient type
+) -> List[Dict[str, Any]]:
+    """
+    Send Template B (avoidance) retrieval query to Letta memory agent using passages.search API,
+    and return a list of avoidance episodic memory passages.
+    
+    Args:
+        memory_agent_id: Letta agent ID for memory operations (unused, kept for API compatibility)
+        query_text: Query string built by build_avoidance_retrieval_query_b()
+        letta_client: AMMLettaClient instance
+        
+    Returns:
+        List of episodic memory passage dictionaries (each has content, tags, timestamp, relevance)
+        
+    Raises:
+        Exception: If retrieval fails
+    """
+    logger.info("[AMM Retrieval] Starting B (avoidance) retrieval via passages.search")
+    logger.info(f"[AMM Retrieval] Query:\n{query_text}")
+    
+    try:
+        # Call Letta using passages.search API via client method
+        passages = letta_client.retrieve_memories(query_text, top_k=10)
+        
+        logger.info(f"[AMM Retrieval] Retrieved {len(passages)} episodic memory passages (B: avoidance)")
+        
+        # Log retrieved passages in a clean format
+        for i, passage in enumerate(passages):
+            passage_preview = json.dumps(passage, indent=2)[:300] + "..." if len(json.dumps(passage)) > 300 else json.dumps(passage, indent=2)
+            logger.info(f"[AMM Retrieval] Passage {i+1}:\n{passage_preview}")
+        
+        return passages
+        
+    except Exception as e:
+        logger.error(f"[AMM Retrieval] B (avoidance) retrieval failed: {e}")
         raise
 
 

@@ -139,6 +139,8 @@ def eval(args, task_num, logger):
     from amm.schema import MemoryRecord
     from amm.config import DEFAULT_CONFIG
     from amm.tagging import classify_episode
+    from amm.retrieval import build_avoidance_retrieval_query_b, retrieve_avoidance_ems_b
+    from amm.formatters import _parse_inventory_text
 
     # Initialize AMM client and working memory
     # Get API token and agent ID from environment or config
@@ -660,6 +662,61 @@ def eval(args, task_num, logger):
             if is_action_failed(obs):
                 logger.info(f"\t\t Failed: [{action}] --> {obs}")
                 failed_messages.append(f"\t\t Failed action: (in {current_place}) [{action}] --> {obs}")
+            
+            # === T3 TRIGGER: Repeated Invalid Action (Retrieval B - Avoidance EMs) ===
+            INVALID_OBS = "No known action matches that input."
+            if (
+                amm_client is not None
+                and DEFAULT_CONFIG.enable_em_retrieval
+                and DEFAULT_CONFIG.enable_t3_retrieval
+                and len(recent_actions) >= 2
+                and len(recent_obs) >= 1
+            ):
+                last_action = recent_actions[-1]
+                prev_action = recent_actions[-2]
+                last_obs = recent_obs[-1].strip()
+                
+                is_invalid_obs = (last_obs == INVALID_OBS)
+                is_repeated_action = (last_action == prev_action)
+                
+                if is_invalid_obs and is_repeated_action:
+                    logger.info(
+                        "[T3 Trigger] Repeated invalid action '%s' with observation '%s' "
+                        "→ retrieving avoidance (B) EMs",
+                        last_action,
+                        last_obs,
+                    )
+                    
+                    current_room = get_current_room(info['look']) or "unknown"
+                    inventory_items = _parse_inventory_text(env.inventory())
+                    
+                    rewards_window = recent_reward[-5:] if len(recent_reward) > 5 else recent_reward
+                    actions_window = recent_actions[-5:] if len(recent_actions) > 5 else recent_actions
+                    obs_window = recent_obs[-5:] if len(recent_obs) > 5 else recent_obs
+                    
+                    query_b = build_avoidance_retrieval_query_b(
+                        task_description=task_description,
+                        room_name=current_room,
+                        inventory_items=inventory_items,
+                        recent_rewards=rewards_window,
+                        current_score=score_true,
+                        look_description=info['look'],
+                        recent_actions=actions_window,
+                        recent_observations=obs_window,
+                    )
+                    
+                    avoidance_ems = retrieve_avoidance_ems_b(
+                        memory_agent_id=amm_client.agent_id,
+                        query_text=query_b,
+                        letta_client=amm_client,
+                    )
+                    
+                    wm.set_avoidance_memories(avoidance_ems)
+                    logger.info(
+                        "[T3 Trigger] Stored %d avoidance EMs in WorkingMemory",
+                        len(avoidance_ems),
+                    )
+            # ================================================================
             
             # if the focus on is useful (positive reward) we will track it
             if reward_true > 0 and action.startswith("focus on"):

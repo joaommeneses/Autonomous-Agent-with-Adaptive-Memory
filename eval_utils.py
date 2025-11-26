@@ -15,6 +15,7 @@ import string
 import editdistance
 import time 
 import tiktoken 
+from typing import List, Dict, Any
 
 from slow_agent import local_llm
 
@@ -869,6 +870,99 @@ def findValidActionWithSystem2(
     assert enable_system2 or force_system_2
     fast_action = action if found_valid_in_top else None
     logger.info("Now, start using System 2: Gemini for reasoning")
+
+    # === T4 TRIGGER: Sage Invocation (Retrieve S2 + B EMs for Planning) ===
+    episodic_memories_for_planning: List[Dict[str, Any]] = []
+    
+    if (
+        use_memory_planning
+        and amm_client is not None
+    ):
+        from amm.config import DEFAULT_CONFIG
+        from amm.retrieval import (
+            build_success_retrieval_query_s2,
+            retrieve_success_ems_s2,
+            build_avoidance_retrieval_query_b,
+            retrieve_avoidance_ems_b,
+        )
+        from amm.formatters import _parse_inventory_text
+        
+        if (
+            DEFAULT_CONFIG.enable_em_retrieval
+            and DEFAULT_CONFIG.enable_t4_retrieval
+        ):
+            logger.info("[T4 Trigger] Sage invoked → retrieving S2 EMs for planning")
+            
+            current_room = get_current_room(look) or "unknown"
+            inventory_items = _parse_inventory_text(inventory)
+            
+            rewards_window = recent_reward[-5:] if len(recent_reward) > 5 else recent_reward
+            scores_window = recent_scores[-5:] if (recent_scores and len(recent_scores) > 5) else (recent_scores or [])
+            current_score_val = current_score if current_score is not None else (
+                scores_window[-1] * 100 if scores_window else 0.0
+            )
+            
+            actions_window = recent_actions[-5:] if len(recent_actions) > 5 else recent_actions
+            obs_window = recent_obs[-5:] if len(recent_obs) > 5 else recent_obs
+            
+            # S2 retrieval (success + partial)
+            query_s2 = build_success_retrieval_query_s2(
+                task_description=task_description,
+                room_name=current_room,
+                inventory_items=inventory_items,
+                recent_rewards=rewards_window,
+                current_score=current_score_val,
+                look_description=look,
+                recent_actions=actions_window,
+                recent_observations=obs_window,
+            )
+            success_ems = retrieve_success_ems_s2(
+                memory_agent_id=amm_client.agent_id,
+                query_text=query_s2,
+                letta_client=amm_client,
+            )
+            logger.info(
+                "[T4 Trigger] S2 retrieval returned %d episodic memories",
+                len(success_ems),
+            )
+            episodic_memories_for_planning.extend(success_ems)
+            
+            avoidance_ems: List[Dict[str, Any]] = []
+            # Optional B (avoidance) retrieval when there are failed/invalid actions
+            if DEFAULT_CONFIG.enable_t3_retrieval and failed_messages:
+                logger.info(
+                    "[T4 Trigger] Failed/invalid actions detected (failed_messages non-empty) "
+                    "→ retrieving B (avoidance) EMs"
+                )
+                query_b = build_avoidance_retrieval_query_b(
+                    task_description=task_description,
+                    room_name=current_room,
+                    inventory_items=inventory_items,
+                    recent_rewards=rewards_window,
+                    current_score=current_score_val,
+                    look_description=look,
+                    recent_actions=actions_window,
+                    recent_observations=obs_window,
+                )
+                avoidance_ems = retrieve_avoidance_ems_b(
+                    memory_agent_id=amm_client.agent_id,
+                    query_text=query_b,
+                    letta_client=amm_client,
+                )
+                logger.info(
+                    "[T4 Trigger] B retrieval returned %d episodic memories",
+                    len(avoidance_ems),
+                )
+                episodic_memories_for_planning.extend(avoidance_ems)
+            
+            logger.info(
+                "[T4 Trigger] Total EMs collected for planning (backbone only) = %d (S2=%d, B=%d)",
+                len(episodic_memories_for_planning),
+                len(success_ems),
+                len(avoidance_ems),
+            )
+            # End of T4 retrieval block
+    # ================================================================
 
     real_action_list = []
     try:
