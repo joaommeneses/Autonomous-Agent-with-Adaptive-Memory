@@ -62,6 +62,15 @@ class AMMLettaClient:
                 last_exception = e
                 error_msg = str(e).lower()
                 
+                # Check for BM25 length errors - abort retries immediately if we hit this
+                # (should not happen with pre-trimming, but safety check)
+                if "bm25 query" in error_msg and "too long" in error_msg:
+                    logger.error(
+                        f"[AMM Letta] BM25 query length error detected despite pre-trimming: {e}. "
+                        "Aborting retries."
+                    )
+                    raise
+                
                 # Check if it's a retryable error (timeout, connection issues)
                 is_retryable = any(keyword in error_msg for keyword in [
                     'timeout', 'timed out', 'connection', 'temporary', 'unavailable'
@@ -80,6 +89,103 @@ class AMMLettaClient:
         
         # Should never reach here, but just in case
         raise last_exception
+    
+    def _prepare_query_for_bm25(self, query: str, limit: int = 1024) -> str:
+        """
+        Ensure the retrieval query is within the BM25 length limit.
+
+        Multi-step pipeline:
+          1. If len(query) <= limit: return query unchanged.
+          2. Otherwise:
+             a) Replace the ACTION_CONTEXT line with a short canonical summary.
+             b) If still > limit, drop all RECENT_OBS lines.
+             c) If still > limit, hard truncate to `limit` characters.
+
+        We intentionally keep:
+          - TASK
+          - STATE
+          - ISSUE
+          - TAG_SCOPE
+          - TAGS_HINT
+          - RECENT_ACTIONS
+
+        We only drop RECENT_OBS (not actions) and compress ACTION_CONTEXT.
+
+        Args:
+            query: Original query string
+            limit: Maximum allowed length in Unicode code points (default 1024)
+
+        Returns:
+            Prepared query string within the limit
+        """
+        original_len = len(query)
+        
+        # Step 1: Check if query is already within limit
+        if original_len <= limit:
+            return query
+        
+        logger.warning(
+            f"[AMM Letta] BM25 query length {original_len} > {limit}; "
+            "applying multi-step trimming pipeline"
+        )
+        
+        # Step 2a: Replace ACTION_CONTEXT with short canonical summary
+        lines = query.splitlines()
+        new_lines = []
+        action_context_replaced = False
+        
+        short_action_context = (
+            'ACTION_CONTEXT: "The agent wants helpful past episodes to guide its next actions."'
+        )
+        
+        for line in lines:
+            if line.strip().startswith("ACTION_CONTEXT:"):
+                new_lines.append(short_action_context)
+                action_context_replaced = True
+            else:
+                new_lines.append(line)
+        
+        query_after_action_context = "\n".join(new_lines)
+        
+        if action_context_replaced:
+            logger.warning(
+                f"[AMM Letta] Summarized ACTION_CONTEXT: "
+                f"length {original_len} → {len(query_after_action_context)}"
+            )
+        
+        if len(query_after_action_context) <= limit:
+            return query_after_action_context
+        
+        # Step 2b: Drop RECENT_OBS lines
+        lines2 = query_after_action_context.splitlines()
+        filtered_lines = []
+        obs_lines_dropped = False
+        
+        for line in lines2:
+            if line.strip().startswith("RECENT_OBS:"):
+                obs_lines_dropped = True
+                # Skip this line
+                continue
+            else:
+                filtered_lines.append(line)
+        
+        query_after_no_obs = "\n".join(filtered_lines)
+        
+        if obs_lines_dropped:
+            logger.warning(
+                f"[AMM Letta] Dropped RECENT_OBS lines: "
+                f"length {len(query_after_action_context)} → {len(query_after_no_obs)}"
+            )
+        
+        if len(query_after_no_obs) <= limit:
+            return query_after_no_obs
+        
+        # Step 2c: Final safety truncate
+        logger.warning(
+            f"[AMM Letta] Still over BM25 limit ({len(query_after_no_obs)} > {limit}); "
+            f"truncating query to {limit} chars"
+        )
+        return query_after_no_obs[:limit]
     
     def add_memory(self, memory: Dict[str, Any]) -> str:
         """
@@ -203,16 +309,25 @@ class AMMLettaClient:
             - timestamp: str
             - relevance: Dict with rrf_score, vector_rank, fts_rank
         """
-        logger.info(f"[AMM Letta] Retrieval requested via passages.search: query_len={len(query)}")
+        original_len = len(query)
+        logger.info(f"[AMM Letta] Retrieval requested via passages.search: query_len={original_len}")
         
         if not self.agent_id:
             raise RuntimeError("[AMM Letta] agent_id is not set; cannot retrieve memories.")
         
+        # Prepare query for BM25 length limit
+        prepared_query = self._prepare_query_for_bm25(query, limit=1024)
+        if len(prepared_query) < original_len:
+            logger.warning(
+                f"[AMM Letta] Query trimmed from {original_len} to {len(prepared_query)} chars "
+                "to respect BM25 length limit"
+            )
+        
         def _retrieve():
-            # Minimal kwargs for now: query only
+            # Minimal kwargs for now: query only (using prepared_query)
             search_kwargs = {
                 "agent_id": self.agent_id,
-                "query": query
+                "query": prepared_query
             }
             
             response = self.client.agents.passages.search(**search_kwargs)
