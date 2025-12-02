@@ -456,7 +456,7 @@ def eval(args, task_num, logger):
                     
                     # Use Sage agent
                     use_memory_planning = args.get("use_memory_planning", True)
-                    used_sys2, return_result = findValidActionWithSystem2(
+                    used_sys2, return_result, found_valid_in_top = findValidActionWithSystem2(
                         predStrs, env, task_num, task_description, info['look'],
                         recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
                         demo_data, logger, sbert_model, step, last_time_system2_steps,
@@ -479,7 +479,14 @@ def eval(args, task_num, logger):
                         prev_obs=prev_obs,
                         objects=objects,
                         places=places
-                    )  
+                    )
+                    
+                    # Update swift_failure_count based on found_valid_in_top (T1 tracks model-level invalidity, not reward)
+                    if not found_valid_in_top:
+                        swift_failure_count += 1
+                    else:
+                        swift_failure_count = 0
+                    
                     if not used_sys2:
                         action = return_result
                         consecutive_system2 = 0
@@ -511,6 +518,21 @@ def eval(args, task_num, logger):
                     input_str = sanitizeStr(input_str)
                     logger.info("InputStr: " + input_str)
                     predStrs = get_model_output(args, input_str, tokenizer, lm_model, device, logger)
+                    
+                    # Check if any top prediction is valid (for swift_failure_count tracking)
+                    validActions = getFilteredValidActions(env, info['look'], task_id=task_num, task_desc=task_description)
+                    found_valid_in_top = False
+                    for pred in predStrs[:1]:  # Check top prediction only (matching findValidActionWithSystem2 logic)
+                        if pred.strip() in validActions:
+                            found_valid_in_top = True
+                            break
+                    
+                    # Update swift_failure_count based on found_valid_in_top (T1 tracks model-level invalidity)
+                    if not found_valid_in_top:
+                        swift_failure_count += 1
+                    else:
+                        swift_failure_count = 0
+                    
                     action = findValidActionNew(predStrs, env, info['look'], recent_actions, sbert_model, logger) 
             
  
@@ -565,10 +587,9 @@ def eval(args, task_num, logger):
             no_action_done = 0
             prev_action = action
             recent_reward.append(reward_true/100)
-            if reward_true == 0.0:
-                swift_failure_count += 1
-            else:
-                swift_failure_count = 0
+            # Note: swift_failure_count is now tracked based on found_valid_in_top (model-level invalidity)
+            # in findValidActionWithSystem2, not based on reward. Reward-based tracking is handled
+            # separately via cycles_without_progress for T2 (stagnation) trigger.
             recent_scores.append(score_true/100)
             recent_actions.append(action) 
             recent_obs.append(obs)

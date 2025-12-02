@@ -714,7 +714,7 @@ def findValidActionWithSystem2(
                         
                         if second_found_valid and second_action is not None:
                             logger.info("[T1 Trigger] Second Swift attempt after S2 retrieval succeeded → using fast action, skipping System 2")
-                            return False, second_action
+                            return False, second_action, False  # found_valid_in_top=False (we're using second_action, but original Swift failed)
                         else:
                             logger.info("[T1 Trigger] Second Swift attempt still has no valid action → falling back to existing System 2 logic")
                     elif not retrieved_ems:
@@ -856,7 +856,7 @@ def findValidActionWithSystem2(
     if found_valid_in_top and not enable_system2 and not force_system_2:
         assert action is not None
         logger.info("Using Fast System output.")
-        return False, action
+        return False, action, found_valid_in_top
 
     if ((not found_valid_in_top and (step - last_sys2) <= 2) or force_system_1) and not force_system_2:
         cand_preds = [try_to_replace(p, validActions, look, inventory)
@@ -864,7 +864,9 @@ def findValidActionWithSystem2(
         cand_preds = cand_preds[:3]
         trial_action = next((p for p in cand_preds if p in validActions), None)
         trial_action = trial_action or (cand_preds[0] if cand_preds else None)
-        return False, trial_action
+        # trial_action might be valid even if found_valid_in_top was False, so check if trial_action is in validActions
+        trial_found_valid = trial_action is not None and trial_action in validActions
+        return False, trial_action, trial_found_valid
 
     # System 2
     assert enable_system2 or force_system_2
@@ -1057,15 +1059,18 @@ def findValidActionWithSystem2(
         # fallback to SBERT
         fb = try_to_replace(predictions[0], validActions, look, inventory)
         fb_action = sbert_search([fb], validActions, sbert_model, logger)
-        return False, fb_action
+        # Fallback action might be valid, but original Swift failed, so found_valid_in_top=False
+        return False, fb_action, False
 
     if not real_action_list:
         # secondary fallback
         fb = try_to_replace(predictions[0], validActions, look, inventory)
         fb_action = sbert_search([fb], validActions, sbert_model, logger)
-        return False, fb_action
+        # Fallback action might be valid, but original Swift failed, so found_valid_in_top=False
+        return False, fb_action, False
 
-    return True, (real_action_list, guess_obs_list)
+    # System 2 succeeded - original Swift failed, so found_valid_in_top=False
+    return True, (real_action_list, guess_obs_list), False
 
 
 
