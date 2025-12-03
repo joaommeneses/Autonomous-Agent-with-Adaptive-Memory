@@ -9,6 +9,8 @@ import json
 import logging
 from typing import List, Dict, Any, Optional
 
+from amm.utils import dedup_memories_by_content
+
 logger = logging.getLogger(__name__)
 
 
@@ -386,7 +388,19 @@ def retrieve_success_ems_s1(
         # Call Letta using passages.search API via client method
         passages = letta_client.retrieve_memories(query_text, top_k=10)
         
-        return passages
+        original_count = len(passages)
+        deduped_passages = dedup_memories_by_content(passages)
+        deduped_count = len(deduped_passages)
+        
+        if deduped_count != original_count:
+            logger.info(
+                f"[AMM Retrieval] Deduplicated S1 memories by content: "
+                f"{original_count} → {deduped_count}"
+            )
+        
+        logger.info(f"[AMM Retrieval] Retrieved {deduped_count} episodic memory passages (S1: success-only)")
+        
+        return deduped_passages
         
     except Exception as e:
         logger.error(f"[AMM Retrieval] Retrieval failed: {e}")
@@ -420,14 +434,24 @@ def retrieve_success_ems_s2(
         # Call Letta using passages.search API via client method
         passages = letta_client.retrieve_memories(query_text, top_k=10)
         
-        logger.info(f"[AMM Retrieval] Retrieved {len(passages)} episodic memory passages (S2: success + near-miss)")
+        original_count = len(passages)
+        deduped_passages = dedup_memories_by_content(passages)
+        deduped_count = len(deduped_passages)
+        
+        if deduped_count != original_count:
+            logger.info(
+                f"[AMM Retrieval] Deduplicated S2 memories by content: "
+                f"{original_count} → {deduped_count}"
+            )
+        
+        logger.info(f"[AMM Retrieval] Retrieved {deduped_count} episodic memory passages (S2: success + near-miss)")
         
         # Log retrieved passages in a clean format
-        for i, passage in enumerate(passages):
+        for i, passage in enumerate(deduped_passages):
             passage_preview = json.dumps(passage, indent=2)[:300] + "..." if len(json.dumps(passage)) > 300 else json.dumps(passage, indent=2)
             logger.info(f"[AMM Retrieval] Passage {i+1}:\n{passage_preview}")
         
-        return passages
+        return deduped_passages
         
     except Exception as e:
         logger.error(f"[AMM Retrieval] S2 retrieval failed: {e}")
@@ -461,14 +485,24 @@ def retrieve_avoidance_ems_b(
         # Call Letta using passages.search API via client method
         passages = letta_client.retrieve_memories(query_text, top_k=10)
         
-        logger.info(f"[AMM Retrieval] Retrieved {len(passages)} episodic memory passages (B: avoidance)")
+        original_count = len(passages)
+        deduped_passages = dedup_memories_by_content(passages)
+        deduped_count = len(deduped_passages)
+        
+        if deduped_count != original_count:
+            logger.info(
+                f"[AMM Retrieval] Deduplicated B memories by content: "
+                f"{original_count} → {deduped_count}"
+            )
+        
+        logger.info(f"[AMM Retrieval] Retrieved {deduped_count} episodic memory passages (B: avoidance)")
         
         # Log retrieved passages in a clean format
-        for i, passage in enumerate(passages):
+        for i, passage in enumerate(deduped_passages):
             passage_preview = json.dumps(passage, indent=2)[:300] + "..." if len(json.dumps(passage)) > 300 else json.dumps(passage, indent=2)
             logger.info(f"[AMM Retrieval] Passage {i+1}:\n{passage_preview}")
         
-        return passages
+        return deduped_passages
         
     except Exception as e:
         logger.error(f"[AMM Retrieval] B (avoidance) retrieval failed: {e}")
