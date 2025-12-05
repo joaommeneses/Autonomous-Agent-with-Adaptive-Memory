@@ -19,6 +19,13 @@ from .retrieval import (
     build_success_retrieval_query_s1, retrieve_success_ems_s1,
     build_success_retrieval_query_s2, retrieve_success_ems_s2
 )
+from .formatters import (
+    build_swift_memories_block,
+    format_episodic_memories_for_swift,
+    get_em_tags,
+    get_em_content,
+    get_em_timestamp,
+)
 
 __version__ = "0.1.0"
 __all__ = [
@@ -41,4 +48,9 @@ __all__ = [
     "retrieve_success_ems_s1",
     "build_success_retrieval_query_s2",
     "retrieve_success_ems_s2",
+    "build_swift_memories_block",
+    "format_episodic_memories_for_swift",
+    "get_em_tags",
+    "get_em_content",
+    "get_em_timestamp",
 ]

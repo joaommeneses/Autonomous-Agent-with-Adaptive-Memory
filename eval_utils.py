@@ -729,6 +729,19 @@ def findValidActionWithSystem2(
                 
                 logger.info(f"[T1 Trigger] Retrieved {len(retrieved_ems)} episodic memories for Swift failure")
                 
+                # Log Swift memory integration (backbone only, no prompt modification yet)
+                if retrieved_ems:
+                    try:
+                        from amm.formatters import build_swift_memories_block
+                        # Call with placeholder input_str for logging (we don't have input_str here yet)
+                        # This is non-invasive: function returns None and doesn't modify anything
+                        _ = build_swift_memories_block(
+                            input_str="[placeholder - Swift input not available at T1 retrieval site]",
+                            episodic_memories=retrieved_ems
+                        )
+                    except Exception as e:
+                        logger.debug(f"[T1 Trigger] Swift memory logging failed (non-critical): {e}")
+                
                 # TODO: Build augmented context for Swift with EMs (commented out for now)
                 # swift_context_with_ems = build_swift_context_with_episodic_memories(
                 #     base_context=base_swift_context_for_this_step,
