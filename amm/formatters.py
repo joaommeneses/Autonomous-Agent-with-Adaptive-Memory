@@ -397,22 +397,33 @@ def shorten_em_for_swift(em: Any, max_chars: int = 400) -> str:
 def build_swift_memories_block(
     input_str: str,
     episodic_memories: Optional[Sequence[Any]],
-) -> str:
+    trigger_context: Optional[str] = None,
+) -> Optional[str]:
     """
-    Build and inject a 'Past similar episodes' block into the Swift input string.
+    Build a Swift memories block from episodic memories (backbone stub).
     
-    If no usable EMs are available, return `input_str` unchanged.
+    For now, this function only logs what would be done and does NOT modify
+    the Swift prompt. It returns None to indicate that the original input_str
+    should be used unchanged.
     
     Args:
-        input_str: Current Swift input string
+        input_str: Current Swift input string (for logging context)
         episodic_memories: Optional sequence of episodic memory objects
+        trigger_context: Optional context string (e.g., "T1", "T2", "T3") for logging
         
     Returns:
-        Augmented input string with memories block, or original input_str if no EMs
+        None (for now, indicating no modification to input_str)
     """
+    # Entry log - always log when this function is called
+    logger.info(
+        f"[AMM SwiftMem] build_swift_memories_block: input_str_len={len(input_str)}, "
+        f"episodic_memories={len(episodic_memories) if episodic_memories else 0}, "
+        f"trigger_context={trigger_context!r}"
+    )
+    
     if not episodic_memories:
         logger.info("[AMM SwiftMem] No episodic memories provided for Swift integration.")
-        return input_str
+        return None
     
     logger.info(
         f"[AMM SwiftMem] Received {len(episodic_memories)} episodic memories for "
@@ -422,35 +433,14 @@ def build_swift_memories_block(
     selected = format_episodic_memories_for_swift(episodic_memories, max_ems=3)
     if not selected:
         logger.info("[AMM SwiftMem] No EMs selected for Swift (after filtering/capping).")
-        return input_str
+        return None
     
-    snippets: List[str] = []
-    for idx, em in enumerate(selected, start=1):
-        ep_text = shorten_em_for_swift(em, max_chars=400)
-        ts = get_em_timestamp(em)
-        logger.debug(
-            f"[AMM SwiftMem] Swift Episode {idx} (timestamp={ts}) snippet:\n{ep_text}"
-        )
-        snippets.append(f"Episode {idx}:\n{ep_text}")
-    
-    memories_block = "\n</s> Past similar episodes (memory hints from previous runs):\n" + \
-        "\n\n".join(snippets) + "\n"
-    
-    marker = "What action should you do next? </s>"
-    if marker in input_str:
-        before, after = input_str.split(marker, 1)
-        augmented = before + memories_block + "\n" + marker + after
-    else:
-        logger.warning(
-            "[AMM SwiftMem] Marker 'What action should you do next? </s>' not found in "
-            "Swift input; appending memories block at the end."
-        )
-        augmented = input_str + "\n" + memories_block
-    
+    # For now, do NOT change the Swift prompt and do NOT build any textual block
+    # Just log what would be used later
     logger.info(
-        f"[AMM SwiftMem] Injected {len(selected)} episodic memories into Swift prompt. "
-        f"Original len={len(input_str)}, new len={len(augmented)}."
+        f"[AMM SwiftMem] Returning None (no prompt modification yet); "
+        f"would inject {len(selected)} EMs into Swift prompt in future phase"
     )
     
-    return augmented
+    return None
 

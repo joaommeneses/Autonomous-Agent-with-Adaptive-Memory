@@ -523,6 +523,20 @@ def rerun_swift_with_same_context(
     from data_utils.data_utils import sanitizeStr
     input_str = sanitizeStr(input_str)
     
+    # Integrate episodic memories for Swift (logging only for now)
+    if retrieved_ems:
+        try:
+            from amm.formatters import build_swift_memories_block
+            # Call with retrieved EMs - for now this only logs, doesn't modify input_str
+            swift_memories_result = build_swift_memories_block(
+                input_str=input_str,
+                episodic_memories=retrieved_ems,
+                trigger_context="T1-second-pass"
+            )
+            # For now, swift_memories_result is None, so we continue with original input_str
+        except Exception as e:
+            logger.debug(f"[T1 Trigger] Swift memory integration failed (non-critical): {e}")
+    
     logger.info("[T1 Trigger] Second Swift pass - InputStr: " + input_str[:200] + "...")
     
     # Call Swift model to get predictions
@@ -729,8 +743,19 @@ def findValidActionWithSystem2(
                 
                 logger.info(f"[T1 Trigger] Retrieved {len(retrieved_ems)} episodic memories for Swift failure")
                 
-                # Note: Swift memory injection happens later when we have input_str
-                # For now, retrieved_ems will be passed to the Swift call site
+                # Log Swift memory integration (backbone only, no prompt modification yet)
+                if retrieved_ems:
+                    try:
+                        from amm.formatters import build_swift_memories_block
+                        # Call with placeholder input_str for logging (actual injection happens at Swift call site)
+                        # This ensures we see [AMM SwiftMem] logs even if we don't have input_str yet
+                        _ = build_swift_memories_block(
+                            input_str="[placeholder - Swift input not available at T1 retrieval site]",
+                            episodic_memories=retrieved_ems,
+                            trigger_context="T1"
+                        )
+                    except Exception as e:
+                        logger.debug(f"[T1 Trigger] Swift memory logging failed (non-critical): {e}")
                 
                 # TODO: Build augmented context for Swift with EMs (commented out for now)
                 # swift_context_with_ems = build_swift_context_with_episodic_memories(
@@ -837,6 +862,17 @@ def findValidActionWithSystem2(
                 
                 if t2_retrieved_ems:
                     logger.info(f"[T2 Trigger] Retrieved {len(t2_retrieved_ems)} episodic memories for stagnation")
+                    # Log Swift memory integration (backbone only, no prompt modification yet)
+                    try:
+                        from amm.formatters import build_swift_memories_block
+                        # Call with placeholder input_str for logging (actual injection happens at Swift call site)
+                        _ = build_swift_memories_block(
+                            input_str="[placeholder - Swift input not available at T2 retrieval site]",
+                            episodic_memories=t2_retrieved_ems,
+                            trigger_context="T2"
+                        )
+                    except Exception as e:
+                        logger.debug(f"[T2 Trigger] Swift memory logging failed (non-critical): {e}")
                     # TODO: Later merge t2_retrieved_ems with other EMs for Sage planning
                     # For now, T2 only retrieves and logs EMs; wiring into prompts comes in T4
                     
