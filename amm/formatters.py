@@ -5,7 +5,10 @@ Provides formatting functions for episodic memories in a canonical, fielded stru
 """
 
 import logging
+import re
 from typing import Iterable, Optional, List, Sequence, Any
+
+from amm.utils import is_structured_episodic_memory
 
 logger = logging.getLogger(__name__)
 
@@ -248,19 +251,28 @@ def format_episodic_memories_for_swift(
         List of selected episodic memory objects (unchanged, no string conversion)
     """
     logger.info(
-        f"[AMM SwiftMem] format_episodic_memories_for_swift: "
-        f"received {len(episodic_memories)} EMs (max_ems={max_ems})"
+        f"[AMM SwiftMem] format_episodic_memories_for_swift: received "
+        f"{len(episodic_memories)} EMs (max_ems={max_ems})."
     )
     
-    if not episodic_memories:
-        logger.info("[AMM SwiftMem] No episodic memories provided, returning empty list")
+    # Filter out unstructured EMs as a safety net
+    structured = [em for em in episodic_memories if is_structured_episodic_memory(em)]
+    if len(structured) < len(episodic_memories):
+        logger.info(
+            f"[AMM SwiftMem] Filtered out {len(episodic_memories) - len(structured)} "
+            "unstructured EMs at Swift formatting stage."
+        )
+    
+    # If nothing structured remains, early-return
+    if not structured:
+        logger.info("[AMM SwiftMem] No structured EMs available for Swift.")
         return []
     
-    # Bucket EMs by tags
+    # Bucket EMs by tags (operate on structured list)
     success_like = []
     avoidance_like = []
     
-    for em in episodic_memories:
+    for em in structured:
         try:
             tags = get_em_tags(em)
             tags_lower = [t.lower() for t in tags]
@@ -334,86 +346,119 @@ def format_episodic_memories_for_swift(
     return selected
 
 
+def shorten_em_for_swift(em: Any, max_chars: int = 400) -> str:
+    """
+    Convert a structured episodic memory into a compact textual snippet for Swift.
+    
+    - Keep key fields (TASK, STATE, ACTION, OBSERVATION, REWARD, WHY_REWARDED, TAGS).
+    - Drop or heavily truncate LOOK to avoid huge room dumps.
+    - Hard truncate at max_chars with an ellipsis if needed.
+    
+    Args:
+        em: Episodic memory object
+        max_chars: Maximum character length for the snippet (default: 400)
+        
+    Returns:
+        Compact textual snippet of the episodic memory
+    """
+    text = get_em_content(em)
+    lines = text.splitlines()
+    
+    kept_lines: List[str] = []
+    inside_look_block = False
+    
+    for line in lines:
+        stripped = line.strip()
+        
+        # Start of LOOK section
+        if stripped.startswith("LOOK:") or stripped.startswith("LOOK::"):
+            # Drop LOOK entirely
+            inside_look_block = True
+            continue
+        
+        # Skip lines inside the LOOK block (room dump)
+        if inside_look_block:
+            # End the LOOK block when we see another high-level field
+            if any(stripped.startswith(prefix) for prefix in (
+                "ACTION:", "OBSERVATION:", "REWARD:", "WHY_REWARDED:", "TAGS:", "TASK:", "STATE:"
+            )):
+                inside_look_block = False
+            else:
+                continue  # still inside LOOK details, skip
+        
+        # At this point, either not in LOOK, or we just detected a new top-level field
+        
+        # Only keep key fields
+        if any(stripped.startswith(prefix) for prefix in (
+            "TASK:", "STATE:", "ACTION:", "OBSERVATION:", "REWARD:", "WHY_REWARDED:", "TAGS:"
+        )):
+            kept_lines.append(stripped)
+    
+    compact = "\n".join(kept_lines).strip()
+    
+    if len(compact) > max_chars:
+        compact = compact[: max_chars - 3].rstrip() + "..."
+    
+    return compact
+
+
 def build_swift_memories_block(
     input_str: str,
     episodic_memories: Optional[Sequence[Any]],
-) -> Optional[str]:
+) -> str:
     """
-    Build a Swift memories block from episodic memories (backbone stub).
+    Build and inject a 'Past similar episodes' block into the Swift input string.
     
-    For now, this function only logs what would be done and does NOT modify
-    the Swift prompt. It returns None to indicate that the original input_str
-    should be used unchanged.
+    If no usable EMs are available, return `input_str` unchanged.
     
     Args:
-        input_str: Current Swift input string (for logging context)
+        input_str: Current Swift input string
         episodic_memories: Optional sequence of episodic memory objects
         
     Returns:
-        None (for now, indicating no modification to input_str)
+        Augmented input string with memories block, or original input_str if no EMs
     """
-    if episodic_memories is None or len(episodic_memories) == 0:
-        logger.info(
-            "[AMM SwiftMem] No episodic memories provided for Swift integration "
-            "(episodic_memories is empty or None)"
-        )
-        return None
+    if not episodic_memories:
+        logger.info("[AMM SwiftMem] No episodic memories provided for Swift integration.")
+        return input_str
     
-    n = len(episodic_memories)
     logger.info(
-        f"[AMM SwiftMem] Received {n} episodic memories for potential Swift integration"
+        f"[AMM SwiftMem] Received {len(episodic_memories)} episodic memories for "
+        "potential Swift integration."
     )
     
-    # Call helper to filter/cap EMs
-    filtered_ems = format_episodic_memories_for_swift(episodic_memories, max_ems=3)
+    selected = format_episodic_memories_for_swift(episodic_memories, max_ems=3)
+    if not selected:
+        logger.info("[AMM SwiftMem] No EMs selected for Swift (after filtering/capping).")
+        return input_str
     
-    # Log tag distribution
-    tag_counts = {}
-    for em in filtered_ems:
-        try:
-            tags = get_em_tags(em)
-            for tag in tags:
-                tag_counts[tag] = tag_counts.get(tag, 0) + 1
-        except Exception:
-            pass
-    
-    tag_dist_str = ", ".join([f"{tag}={count}" for tag, count in tag_counts.items()])
-    if tag_dist_str:
-        logger.info(
-            f"[AMM SwiftMem] After tag filtering/capping: {len(filtered_ems)} EMs selected "
-            f"(max_ems=3), tag distribution: {tag_dist_str}"
+    snippets: List[str] = []
+    for idx, em in enumerate(selected, start=1):
+        ep_text = shorten_em_for_swift(em, max_chars=400)
+        ts = get_em_timestamp(em)
+        logger.debug(
+            f"[AMM SwiftMem] Swift Episode {idx} (timestamp={ts}) snippet:\n{ep_text}"
         )
+        snippets.append(f"Episode {idx}:\n{ep_text}")
+    
+    memories_block = "\n</s> Past similar episodes (memory hints from previous runs):\n" + \
+        "\n\n".join(snippets) + "\n"
+    
+    marker = "What action should you do next? </s>"
+    if marker in input_str:
+        before, after = input_str.split(marker, 1)
+        augmented = before + memories_block + "\n" + marker + after
     else:
-        logger.info(
-            f"[AMM SwiftMem] After tag filtering/capping: {len(filtered_ems)} EMs selected "
-            f"(max_ems=3)"
+        logger.warning(
+            "[AMM SwiftMem] Marker 'What action should you do next? </s>' not found in "
+            "Swift input; appending memories block at the end."
         )
+        augmented = input_str + "\n" + memories_block
     
-    # Log preview per EM (timestamp + first 80 chars of content, tags)
-    for i, em in enumerate(filtered_ems):
-        try:
-            content = get_em_content(em)
-            timestamp = get_em_timestamp(em)
-            tags = get_em_tags(em)
-            
-            content_preview = content[:80] + "..." if len(content) > 80 else content
-            tags_str = ", ".join(tags) if tags else "N/A"
-            
-            logger.info(
-                f"[AMM SwiftMem] Preview EM {i+1}: timestamp={timestamp}, "
-                f"tags=[{tags_str}], content=\"{content_preview}\""
-            )
-        except Exception as e:
-            logger.warning(
-                f"[AMM SwiftMem] Failed to log preview for EM {i+1}: {e}"
-            )
-    
-    # For now, do NOT change the Swift prompt and do NOT build any textual block
-    # Just log what would be used later
     logger.info(
-        "[AMM SwiftMem] Returning None (no prompt modification yet); "
-        f"would inject {len(filtered_ems)} EMs into Swift prompt in future phase"
+        f"[AMM SwiftMem] Injected {len(selected)} episodic memories into Swift prompt. "
+        f"Original len={len(input_str)}, new len={len(augmented)}."
     )
     
-    return None
+    return augmented
 

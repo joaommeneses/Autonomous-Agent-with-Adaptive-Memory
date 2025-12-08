@@ -9,7 +9,7 @@ import json
 import logging
 from typing import List, Dict, Any, Optional
 
-from amm.utils import dedup_memories_by_content
+from amm.utils import dedup_memories_by_content, is_structured_episodic_memory, get_em_content
 
 logger = logging.getLogger(__name__)
 
@@ -388,8 +388,26 @@ def retrieve_success_ems_s1(
         # Call Letta using passages.search API via client method
         passages = letta_client.retrieve_memories(query_text, top_k=10)
         
-        original_count = len(passages)
-        deduped_passages = dedup_memories_by_content(passages)
+        # Filter out legacy/unstructured EMs before deduplication
+        raw_count = len(passages)
+        structured_passages = [em for em in passages if is_structured_episodic_memory(em)]
+        dropped = raw_count - len(structured_passages)
+        
+        if dropped > 0:
+            logger.info(
+                f"[AMM Retrieval] Dropped {dropped}/{raw_count} legacy/unstructured EMs "
+                "before dedup (missing TASK/STATE)."
+            )
+            # Optionally log a short preview of the first dropped EM
+            for em in passages:
+                if not is_structured_episodic_memory(em):
+                    preview = get_em_content(em)[:200].replace("\n", " ")
+                    logger.debug(f"[AMM Retrieval] Example dropped EM content preview: {preview}...")
+                    break
+        
+        # Now run dedup on structured_passages only
+        original_count = len(structured_passages)
+        deduped_passages = dedup_memories_by_content(structured_passages)
         deduped_count = len(deduped_passages)
         
         if deduped_count != original_count:
@@ -434,8 +452,26 @@ def retrieve_success_ems_s2(
         # Call Letta using passages.search API via client method
         passages = letta_client.retrieve_memories(query_text, top_k=10)
         
-        original_count = len(passages)
-        deduped_passages = dedup_memories_by_content(passages)
+        # Filter out legacy/unstructured EMs before deduplication
+        raw_count = len(passages)
+        structured_passages = [em for em in passages if is_structured_episodic_memory(em)]
+        dropped = raw_count - len(structured_passages)
+        
+        if dropped > 0:
+            logger.info(
+                f"[AMM Retrieval] Dropped {dropped}/{raw_count} legacy/unstructured EMs "
+                "before dedup (missing TASK/STATE)."
+            )
+            # Optionally log a short preview of the first dropped EM
+            for em in passages:
+                if not is_structured_episodic_memory(em):
+                    preview = get_em_content(em)[:200].replace("\n", " ")
+                    logger.debug(f"[AMM Retrieval] Example dropped EM content preview: {preview}...")
+                    break
+        
+        # Now run dedup on structured_passages only
+        original_count = len(structured_passages)
+        deduped_passages = dedup_memories_by_content(structured_passages)
         deduped_count = len(deduped_passages)
         
         if deduped_count != original_count:
@@ -485,8 +521,26 @@ def retrieve_avoidance_ems_b(
         # Call Letta using passages.search API via client method
         passages = letta_client.retrieve_memories(query_text, top_k=10)
         
-        original_count = len(passages)
-        deduped_passages = dedup_memories_by_content(passages)
+        # Filter out legacy/unstructured EMs before deduplication
+        raw_count = len(passages)
+        structured_passages = [em for em in passages if is_structured_episodic_memory(em)]
+        dropped = raw_count - len(structured_passages)
+        
+        if dropped > 0:
+            logger.info(
+                f"[AMM Retrieval] Dropped {dropped}/{raw_count} legacy/unstructured EMs "
+                "before dedup (missing TASK/STATE)."
+            )
+            # Optionally log a short preview of the first dropped EM
+            for em in passages:
+                if not is_structured_episodic_memory(em):
+                    preview = get_em_content(em)[:200].replace("\n", " ")
+                    logger.debug(f"[AMM Retrieval] Example dropped EM content preview: {preview}...")
+                    break
+        
+        # Now run dedup on structured_passages only
+        original_count = len(structured_passages)
+        deduped_passages = dedup_memories_by_content(structured_passages)
         deduped_count = len(deduped_passages)
         
         if deduped_count != original_count:

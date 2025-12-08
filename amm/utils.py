@@ -11,6 +11,57 @@ from typing import Any, List
 logger = logging.getLogger(__name__)
 
 
+def get_em_content(em: Any) -> str:
+    """
+    Extract content from an episodic memory object.
+    
+    Works with both dict-like and object-like memories.
+    
+    Args:
+        em: Episodic memory object (dict or object with content attribute)
+        
+    Returns:
+        Content string, or empty string if content not found
+    """
+    content = getattr(em, "content", None)
+    if content is None and isinstance(em, dict):
+        content = em.get("content", "")
+    return str(content or "")
+
+
+def is_structured_episodic_memory(em: Any) -> bool:
+    """
+    Heuristically determine whether an episodic memory is in the
+    newer structured format:
+      - Must contain 'TASK:' and 'STATE:' in content.
+      - Ideally also ACTION / OBSERVATION / REWARD / WHY_REWARDED / TAGS.
+    
+    Returns True if content looks structured; False for old narrative-style EMs.
+    """
+    content = getattr(em, "content", None)
+    if content is None and isinstance(em, dict):
+        content = em.get("content")
+    
+    if not content:
+        return False
+    
+    text = str(content)
+    has_task = "TASK:" in text
+    has_state = "STATE:" in text
+    
+    if not (has_task and has_state):
+        return False
+    
+    # Optional: soft check for at least one detail field
+    has_any_detail = any(
+        key in text
+        for key in ("ACTION:", "OBSERVATION:", "REWARD:", "WHY_REWARDED:", "TAGS:")
+    )
+    
+    # For now, require TASK+STATE; log missing detail fields elsewhere if useful.
+    return has_task and has_state
+
+
 def dedup_memories_by_content(memories: List[Any]) -> List[Any]:
     """
     Deduplicate a list of episodic memory objects based on their textual content.
