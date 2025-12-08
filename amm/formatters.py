@@ -8,7 +8,7 @@ import logging
 import re
 from typing import Iterable, Optional, List, Sequence, Any
 
-from amm.utils import is_structured_episodic_memory
+from amm.utils import is_structured_episodic_memory, get_em_content
 
 logger = logging.getLogger(__name__)
 
@@ -196,24 +196,6 @@ def get_em_tags(em: Any) -> List[str]:
     return list(tags) if tags else []
 
 
-def get_em_content(em: Any) -> str:
-    """
-    Extract content from an episodic memory object.
-    
-    Works with both dict-like and object-like memories.
-    
-    Args:
-        em: Episodic memory object (dict or object with content attribute)
-        
-    Returns:
-        Content string, or empty string if content not found
-    """
-    content = getattr(em, "content", None)
-    if content is None and isinstance(em, dict):
-        content = em.get("content", "")
-    return str(content or "")
-
-
 def get_em_timestamp(em: Any) -> str:
     """
     Extract timestamp from an episodic memory object.
@@ -252,16 +234,26 @@ def format_episodic_memories_for_swift(
     """
     logger.info(
         f"[AMM SwiftMem] format_episodic_memories_for_swift: received "
-        f"{len(episodic_memories)} EMs (max_ems={max_ems})."
+        f"{len(episodic_memories)} EMs (max_ems={max_ems})"
     )
     
-    # Filter out unstructured EMs as a safety net
+    # Filter out unstructured EMs before tag bucketing/capping
     structured = [em for em in episodic_memories if is_structured_episodic_memory(em)]
     if len(structured) < len(episodic_memories):
+        dropped_count = len(episodic_memories) - len(structured)
         logger.info(
-            f"[AMM SwiftMem] Filtered out {len(episodic_memories) - len(structured)} "
-            "unstructured EMs at Swift formatting stage."
+            f"[AMM SwiftMem] Filtered out {dropped_count} "
+            "unstructured EMs before tag bucketing/capping."
         )
+        # Log preview of one dropped EM for debugging
+        for em in episodic_memories:
+            if not is_structured_episodic_memory(em):
+                preview = get_em_content(em)[:200].replace("\n", " ")
+                logger.debug(
+                    "[AMM SwiftMem] Example dropped unstructured EM preview: "
+                    f"{preview}..."
+                )
+                break
     
     # If nothing structured remains, early-return
     if not structured:
