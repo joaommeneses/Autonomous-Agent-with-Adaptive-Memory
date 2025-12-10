@@ -338,6 +338,180 @@ def format_episodic_memories_for_swift(
     return selected
 
 
+def _truncate(s: str, max_len: int) -> str:
+    """Helper to safely truncate a string and append ... if needed."""
+    if not s:
+        return ""
+    s = s.strip()
+    if len(s) <= max_len:
+        return s
+    return s[:max_len - 3].rstrip() + "..."
+
+
+def _parse_state_line(state_line: str) -> tuple[str, str]:
+    """
+    Parse STATE line to extract room and inventory.
+    
+    Format: STATE: room=kitchen; inventory=[orange, cup]
+    
+    Returns:
+        (room, inventory_str) where inventory_str is the full [item1, item2] portion
+    """
+    room = "unknown"
+    inventory_str = "[]"
+    
+    if not state_line:
+        return room, inventory_str
+    
+    # Extract room= value
+    room_match = re.search(r'room=([^;]+)', state_line)
+    if room_match:
+        room = room_match.group(1).strip()
+    
+    # Extract inventory=[...] portion
+    inv_match = re.search(r'inventory=\[(.*?)\]', state_line)
+    if inv_match:
+        inventory_str = f"[{inv_match.group(1).strip()}]"
+    
+    return room, inventory_str
+
+
+def _parse_field_from_content(content: str, field_name: str) -> str:
+    """
+    Parse a field value from structured EM content.
+    
+    Looks for lines like "FIELD_NAME: value" and extracts the value.
+    Handles multi-line values by taking everything after the colon until the next field.
+    """
+    if not content:
+        return ""
+    
+    lines = content.splitlines()
+    field_prefix = f"{field_name}:"
+    value_parts = []
+    collecting = False
+    
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(field_prefix):
+            # Found the field, extract value after colon
+            value = stripped[len(field_prefix):].strip()
+            if value:
+                value_parts.append(value)
+            collecting = True
+        elif collecting:
+            # Check if this is the start of another field
+            if any(stripped.startswith(prefix + ":") for prefix in (
+                "TASK", "STATE", "LOOK", "ACTION", "OBSERVATION", "REWARD", 
+                "WHY_REWARDED", "TAGS", "RECENT_ACTIONS", "RECENT_OBS"
+            )):
+                break
+            elif stripped:
+                value_parts.append(stripped)
+    
+    result = " ".join(value_parts).strip()
+    # Remove quotes if present
+    if result.startswith('"') and result.endswith('"'):
+        result = result[1:-1]
+    return result
+
+
+def _classify_episode_type(tags_str: str) -> str:
+    """
+    Classify episode type based on tags string.
+    
+    Returns: "success", "nearmiss", "avoidance", or "other"
+    """
+    tags_lower = tags_str.lower()
+    
+    if "episodic_success" in tags_lower:
+        return "success"
+    elif "episodic_nearmiss" in tags_lower or "nearmiss" in tags_lower:
+        return "nearmiss"
+    elif "avoidance" in tags_lower or "invalid_action" in tags_lower or "episodic_failure" in tags_lower:
+        return "avoidance"
+    else:
+        return "other"
+
+
+def compact_em_for_swift(em: Any, idx: int) -> str:
+    """
+    Convert a structured episodic memory into a compact, single-line snippet for Swift.
+    
+    Format: [Past Episode {idx} — {episode_type}] room={room}; inv={inventory}; 
+            did: "{action}" → obs: "{observation}" (reward {reward}, tags: {tags})
+    
+    Args:
+        em: Episodic memory object (dict or object with content attribute)
+        idx: 1-based index for this EM
+        
+    Returns:
+        Single-line compact snippet string
+    """
+    content = get_em_content(em)
+    
+    # Parse STATE line
+    state_line = ""
+    for line in content.splitlines():
+        if line.strip().startswith("STATE:"):
+            state_line = line.strip()
+            break
+    
+    room, inventory_str = _parse_state_line(state_line)
+    room = _truncate(room, max_len=40)
+    inventory_str = _truncate(inventory_str, max_len=60)
+    
+    # Parse ACTION
+    action = _parse_field_from_content(content, "ACTION")
+    action = _truncate(action, max_len=80)
+    if not action:
+        action = "N/A"
+    
+    # Parse OBSERVATION
+    observation = _parse_field_from_content(content, "OBSERVATION")
+    observation = _truncate(observation, max_len=80)
+    if not observation:
+        observation = "N/A"
+    
+    # Parse REWARD
+    reward_str = _parse_field_from_content(content, "REWARD")
+    if not reward_str:
+        reward_str = "N/A"
+    else:
+        # Extract just the reward value (e.g., "+50.0" from "+50.0 (20.0→70.0)")
+        reward_match = re.search(r'([+-]?\d+\.?\d*)', reward_str)
+        if reward_match:
+            reward_str = reward_match.group(1)
+            # Ensure sign is present
+            if not reward_str.startswith(('+', '-')):
+                reward_str = '+' + reward_str
+    
+    # Parse TAGS
+    tags_str = _parse_field_from_content(content, "TAGS")
+    tags_str = _truncate(tags_str, max_len=80)
+    if not tags_str:
+        tags_str = "N/A"
+    
+    # Classify episode type
+    episode_type = _classify_episode_type(tags_str)
+    
+    # Build snippet
+    snippet = (
+        f"[Past Episode {idx} — {episode_type}] "
+        f"room={room}; inv={inventory_str}; "
+        f'did: "{action}" → obs: "{observation}" '
+        f"(reward {reward_str}, tags: {tags_str})"
+    )
+    
+    # Ensure single line (replace any newlines with spaces)
+    snippet = " ".join(snippet.split())
+    
+    # Log the snippet
+    logger.info(f"[AMM SwiftMem] Swift snippet {idx}: {snippet}")
+    
+    return snippet
+
+
 def shorten_em_for_swift(em: Any, max_chars: int = 400) -> str:
     """
     Convert a structured episodic memory into a compact textual snippet for Swift.
@@ -400,19 +574,18 @@ def build_swift_memories_block(
     trigger_context: Optional[str] = None,
 ) -> Optional[str]:
     """
-    Build a Swift memories block from episodic memories (backbone stub).
+    Build and inject a Swift memories block from episodic memories into the input string.
     
-    For now, this function only logs what would be done and does NOT modify
-    the Swift prompt. It returns None to indicate that the original input_str
-    should be used unchanged.
+    If no usable EMs are available, returns None so caller uses original input_str.
+    Otherwise, returns augmented input_str with EM block injected before "What action should you do next? </s>".
     
     Args:
-        input_str: Current Swift input string (for logging context)
+        input_str: Current Swift input string
         episodic_memories: Optional sequence of episodic memory objects
         trigger_context: Optional context string (e.g., "T1", "T2", "T3") for logging
         
     Returns:
-        None (for now, indicating no modification to input_str)
+        Augmented input string with memories block, or None if no EMs or injection failed
     """
     # Entry log - always log when this function is called
     logger.info(
@@ -435,12 +608,51 @@ def build_swift_memories_block(
         logger.info("[AMM SwiftMem] No EMs selected for Swift (after filtering/capping).")
         return None
     
-    # For now, do NOT change the Swift prompt and do NOT build any textual block
-    # Just log what would be used later
-    logger.info(
-        f"[AMM SwiftMem] Returning None (no prompt modification yet); "
-        f"would inject {len(selected)} EMs into Swift prompt in future phase"
+    # Generate compact snippets for each selected EM
+    snippets: List[str] = []
+    for idx, em in enumerate(selected, start=1):
+        try:
+            snippet = compact_em_for_swift(em, idx)
+            snippets.append(snippet)
+        except Exception as e:
+            logger.warning(
+                f"[AMM SwiftMem] Failed to create compact snippet for EM {idx}: {e}. Skipping."
+            )
+            continue
+    
+    if not snippets:
+        logger.warning("[AMM SwiftMem] No valid snippets generated from selected EMs.")
+        return None
+    
+    logger.info(f"[AMM SwiftMem] Prepared {len(snippets)} Swift-ready EM snippets.")
+    
+    # Build the memories block
+    # Format: </s> Relevant past episodes (from memory): </s> [snippet1] | [snippet2] | [snippet3] </s>
+    mem_block = (
+        "</s> Relevant past episodes (from memory): </s> " +
+        " | ".join(snippets) +
+        " </s> "
     )
     
-    return None
+    logger.info(f"[AMM SwiftMem] Swift EM block:\n{mem_block}")
+    
+    # Inject into input_str right before "What action should you do next? </s>"
+    marker = "What action should you do next? </s>"
+    
+    if marker not in input_str:
+        logger.warning(
+            "[AMM SwiftMem] WARNING: Could not find 'What action should you do next? </s>' "
+            "in input_str; skipping EM injection."
+        )
+        return None
+    
+    # Replace marker with mem_block + marker (only first occurrence)
+    augmented_input_str = input_str.replace(marker, mem_block + marker, 1)
+    
+    logger.info(
+        f"[AMM SwiftMem] Injected EM block into Swift prompt "
+        f"(original length: {len(input_str)}, new length: {len(augmented_input_str)})."
+    )
+    
+    return augmented_input_str
 

@@ -523,17 +523,17 @@ def rerun_swift_with_same_context(
     from data_utils.data_utils import sanitizeStr
     input_str = sanitizeStr(input_str)
     
-    # Integrate episodic memories for Swift (logging only for now)
+    # Integrate episodic memories for Swift
     if retrieved_ems:
         try:
             from amm.formatters import build_swift_memories_block
-            # Call with retrieved EMs - for now this only logs, doesn't modify input_str
-            swift_memories_result = build_swift_memories_block(
+            augmented_input = build_swift_memories_block(
                 input_str=input_str,
                 episodic_memories=retrieved_ems,
                 trigger_context="T1-second-pass"
             )
-            # For now, swift_memories_result is None, so we continue with original input_str
+            if augmented_input is not None:
+                input_str = augmented_input
         except Exception as e:
             logger.debug(f"[T1 Trigger] Swift memory integration failed (non-critical): {e}")
     
