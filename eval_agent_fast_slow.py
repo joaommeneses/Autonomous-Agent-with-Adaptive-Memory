@@ -15,6 +15,9 @@ from data_utils.data_utils import compose_instance_v1, compose_instance_v1_1, co
 from eval_utils import load_model, findValidActionNew, load_variation, get_model_output, findValidActionWithSystem2, getFilteredValidActions, sbert_search, clean_look, is_action_failed 
 from eval_utils import try_to_replace, rooms, clean_history, get_current_room, clean_obj_name, focus_on_count, rank_candidates_by_common_words, gpt_select_valid
 
+# AMM imports (used for EM writing and T3 retrieval, not for proactive Swift retrieval)
+from amm.config import DEFAULT_CONFIG
+
 
 # from scienceworld
 from py4j.java_gateway import JavaGateway, GatewayParameters, launch_gateway, CallbackServerParameters
@@ -22,6 +25,8 @@ from scienceworld.constants import BASEPATH, DEBUG_MODE, ID2TASK, JAR_PATH, NAME
 from scienceworld.utils import infer_task
 import logging
 logger = logging.getLogger(__name__)
+from dotenv import load_dotenv
+load_dotenv()
 
 class MyScienceWorldEnv(ScienceWorldEnv):
     # it is only used for fixing the logging error --> logger.info(f"ScienceWorld server running on {port}") 
@@ -100,6 +105,31 @@ def get_file_name(args, task_num):
   
 
 
+# ============================================================================
+# BASELINE SWIFT BEHAVIORAL CONTRACT (enforced when use_amm=False, use_sage=False)
+# ============================================================================
+# Baseline Swift must match original implementation exactly:
+# 1. Prompt: compose_instance_v4() builds prompt with exact structure:
+#    - Task description, Time/Score/ReturnsToGo, Action history (last 5),
+#    - Current environment (look, inventory, visited rooms)
+#    - No memory/guidance blocks injected
+# 2. Model: get_model_output() calls Flan-T5 with:
+#    - max_length=16, beams=5 (from args["beams"])
+#    - No stop tokens modification
+# 3. Parsing: findValidActionNew() uses:
+#    - Exact match against validActions first (top k=5)
+#    - SBERT similarity fallback if no exact match
+#    - Jaccard fallback if SBERT unavailable
+# 4. Validation: getFilteredValidActions() provides same validActions list
+#    - Same filtering rules (door, focus constraints)
+#    - Same sorting/truncation
+# 5. Invalid action handling: 
+#    - If no valid action found → fallback to "wait" (queued in buffer)
+#    - No retry loop (single Swift call per step)
+# 6. No AMM calls: No retrieval, no writing, no memory injection
+# 7. No Sage calls: No System 2 planning/grounding
+# ============================================================================
+
 # Example user input console, to play through a game.
 def eval(args, task_num, logger):
     # if args["compose_mode"] == "v1":
@@ -132,15 +162,24 @@ def eval(args, task_num, logger):
     gpt_version = args["gpt_version"]
     scores = []
 
-    # === AMM INIT ===
+    # === FEATURE FLAGS: Control AMM and Sage architecture ===
+    # When both False: baseline Swift-only mode (no AMM, no Sage)
+    use_amm = args.get("use_amm", True)  # Enable AMM retrieval/writing
+    use_sage = args.get("use_sage", True)  # Enable Sage/System 2 (requires slow_agent=True)
+    # =========================================================
+
+    # === AMM INIT (only when use_amm=True) ===
+    amm_client = None
+    wm = None
+    if use_amm:
     from amm.client_letta import AMMLettaClient, LettaConfig
     from amm.working_memory import WorkingMemory
     from amm.writer import write_success, write_nearmiss, write_avoidance, create_memory_record
     from amm.schema import MemoryRecord
     from amm.config import DEFAULT_CONFIG
     from amm.tagging import classify_episode
-    from amm.retrieval import build_avoidance_retrieval_query_b, retrieve_avoidance_ems_b
-    from amm.formatters import _parse_inventory_text
+        from amm.retrieval import build_avoidance_retrieval_query_b, retrieve_avoidance_ems_b
+        from amm.formatters import _parse_inventory_text
 
     # Initialize AMM client and working memory
     # Get API token and agent ID from environment or config
@@ -149,8 +188,8 @@ def eval(args, task_num, logger):
     
     if not letta_api_token or not letta_agent_id:
         raise ValueError(
-            "LETTA_API_TOKEN and LETTA_AGENT_ID environment variables must be set. "
-            "Please set them before running the agent."
+                "LETTA_API_TOKEN and LETTA_AGENT_ID environment variables must be set when use_amm=True. "
+                "Please set them before running the agent, or set use_amm=False for baseline mode."
         )
     
     amm_config = LettaConfig(
@@ -162,6 +201,8 @@ def eval(args, task_num, logger):
     wm = WorkingMemory()
     logger.info("[AMM] Adaptive Memory Module initialized with Cloud API")
     logger.info(f"[AMM] Using agent ID: {letta_agent_id}")
+    else:
+        logger.info("[Baseline] Running in baseline Swift-only mode (use_amm=False, use_sage=False)")
     # =================
 
     for variation in variations:
@@ -173,7 +214,8 @@ def eval(args, task_num, logger):
         task_description = env.taskdescription()[18:]
         logger.info(f"task_description = {task_description}")
         
-        # === AMM HOOK: EPISODE RESET ===
+        # === AMM HOOK: EPISODE RESET (only when use_amm=True) ===
+        if use_amm and wm is not None:
         wm.reset()
         wm.pending_subgoal = task_description
         logger.info(f"[AMM] Working memory reset for new episode: {task_description[:50]}...")
@@ -234,10 +276,13 @@ def eval(args, task_num, logger):
         failed_messages = []
         while not done:           
  
+            # Per-iteration flag: track if action came from buffer (breaks Swift failure streak)
+            picked_from_buffer = False
 
             no_action_done += 1 
             
             logger.info("-"*50+f"Variation: {variation}, Step: {step}"+"-"*50) 
+            logger.info(f"[T1 Counter] Begin step={step} swift_failure_count={swift_failure_count}")
             logger.info(f"Action Buffer: {action_buffer}")
             logger.info(f"Guess Obs Buffer: {obs_buffer}")
             validActions = getFilteredValidActions(env, info["look"], task_id=task_num, task_desc=task_description)
@@ -308,6 +353,7 @@ def eval(args, task_num, logger):
                         action_buffer.pop(action_ind)
                         obs_buffer.pop(action_ind)
                         action = action_candidate
+                        picked_from_buffer = True
                         buffer_overall_trail = 0
                         break 
                     
@@ -320,6 +366,7 @@ def eval(args, task_num, logger):
                         action_buffer.pop(action_ind)
                         obs_buffer.pop(action_ind)
                         action = action_candidate_v2
+                        picked_from_buffer = True
                         buffer_overall_trail = 0
                         break  
 
@@ -358,6 +405,7 @@ def eval(args, task_num, logger):
                         action_buffer.pop(action_ind)
                         obs_buffer.pop(action_ind)
                         action = final_action
+                        picked_from_buffer = True
                         buffer_overall_trail = 0
                         # Handle ambiguous requests for buffer-executed actions
                         if obs.startswith("Ambiguous request"):
@@ -386,6 +434,7 @@ def eval(args, task_num, logger):
                             if action in validActions:
                                 action_buffer.pop(action_ind)
                                 obs_buffer.pop(action_ind)
+                                picked_from_buffer = True
                                 buffer_overall_trail = 0
                                 logger.info(f"mathced = [{action_candidate}] --> {selections}")
                                 break  
@@ -399,6 +448,10 @@ def eval(args, task_num, logger):
                 action_buffer = [a for ind, a in enumerate(action_buffer) if ind not in to_remove] 
                 obs_buffer = [o for ind, o in enumerate(obs_buffer) if ind not in to_remove] 
                     
+            # Reset Swift failure counter if action came from buffer (breaks consecutive Swift failure streak)
+            if picked_from_buffer:
+                swift_failure_count = 0
+                logger.info("[T1 Counter] Reset swift_failure_count=0 because action came from action_buffer.")
 
             if action is None: 
                 logger.info("Buffer is not useful. Switch to Fast Agent.")
@@ -445,47 +498,80 @@ def eval(args, task_num, logger):
                         force_system_1 = True
                         force_system_2 = False
                         logger.info("Force to do force_system_1")
+                    # === BASELINE SWIFT PATH (when use_sage=False) ===
+                    if not use_sage or not args.get("slow_agent", False):
+                        # Baseline Swift-only mode: no Sage, no AMM retrieval
+                        input_str = sanitizeStr(input_str)
+                        predStrs = get_model_output(args, input_str, tokenizer, lm_model, device, logger)
+                        
+                        # Baseline action selection: findValidActionNew (no AMM, no Sage)
+                        validActions = getFilteredValidActions(env, info['look'], task_id=task_num, task_desc=task_description)
+                        action = findValidActionNew(predStrs, env, info['look'], recent_actions, sbert_model, logger)
+                        
+                        # Baseline validity check
+                        found_valid_in_top = False
+                        for pred in predStrs[:5]:  # Check top 5 (baseline k=5)
+                            if pred.strip() in validActions:
+                                found_valid_in_top = True
+                                break
+                        
+                        used_sys2 = False
+                        return_result = action
+                        
+                    # === ARCHITECTURE PATH (when use_sage=True and slow_agent=True) ===
+                    else:
+                        # Use Sage agent (define use_memory_planning here for both Swift and Sage)
+                        use_memory_planning = args.get("use_memory_planning", True) and use_amm
+
                     # if not force_system_2 or force_system_1:
                     if True:
                         input_str = sanitizeStr(input_str)
-                        logger.info("InputStr: " + input_str)
-                        # Invokes Swift, return top predicted actions
+                            # Invokes Swift, return top predicted actions (baseline SwiftSage - no EM retrieval here)
+                            # EM retrieval only happens AFTER Swift fails (T1 trigger in findValidActionWithSystem2)
                         predStrs = get_model_output(args, input_str, tokenizer, lm_model, device, logger)
                     else:
                         predStrs = []
                     
-                    # Use Sage agent
-                    use_memory_planning = args.get("use_memory_planning", True)
-                    used_sys2, return_result, found_valid_in_top = findValidActionWithSystem2(
+                        # Use Sage agent with AMM integration
+                        cycles_without_progress_val = wm.cycles_without_progress if (use_amm and wm is not None) else 0
+                        used_sys2, return_result, found_valid_in_top = findValidActionWithSystem2(
                         predStrs, env, task_num, task_description, info['look'],
                         recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
                         demo_data, logger, sbert_model, step, last_time_system2_steps,
                         useful_focus_on, focus_on_done, force_system_1, force_system_2,
                         gpt_version, llm=llm,
                         episodic_memories=None,  # AMM will handle memory retrieval in Phase 2
-                        use_memory_planning=use_memory_planning,
-                        amm_client=amm_client,  # Pass AMM client for T1 retrieval
-                        current_score=score,  # Current score for retrieval query
-                        recent_scores=recent_scores,  # Recent scores for retrieval query
-                        swift_failure_count=swift_failure_count,  # Pass swift_failure_count for T1 escalation
-                        cycles_without_progress=wm.cycles_without_progress,  # Pass cycles_without_progress for T2 escalation
-                        # Parameters for second Swift pass (T1-S2 retry)
-                        args=args,
-                        tokenizer=tokenizer,
-                        lm_model=lm_model,
-                        device=device,
-                        compose_instance=compose_instance,
-                        prev_action=prev_action,
-                        prev_obs=prev_obs,
-                        objects=objects,
-                        places=places
-                    )
+                            use_memory_planning=use_memory_planning,
+                            amm_client=amm_client if use_amm else None,  # Pass AMM client only if enabled
+                            current_score=score,  # Current score for retrieval query
+                            recent_scores=recent_scores,  # Recent scores for retrieval query
+                            swift_failure_count=swift_failure_count,  # Pass swift_failure_count for T1 escalation
+                            cycles_without_progress=cycles_without_progress_val,  # Pass cycles_without_progress for T2 escalation
+                            # Parameters for second Swift pass (T1-S2 retry)
+                            args=args,
+                            tokenizer=tokenizer,
+                            lm_model=lm_model,
+                            device=device,
+                            compose_instance=compose_instance,
+                            prev_action=prev_action,
+                            prev_obs=prev_obs,
+                            objects=objects,
+                            places=places
+                        )
                     
                     # Update swift_failure_count based on found_valid_in_top (T1 tracks model-level invalidity, not reward)
-                    if not found_valid_in_top:
-                        swift_failure_count += 1
-                    else:
-                        swift_failure_count = 0
+                    # Only update counter when Swift is actually being used (not forced System 2) and architecture is enabled
+                    if use_sage and args.get("slow_agent", False):
+                        if not force_system_2:
+                            if not found_valid_in_top:
+                                swift_failure_count += 1
+                            else:
+                                swift_failure_count = 0
+                            logger.info(f"[T1 Counter] Swift attempt valid_in_top={found_valid_in_top} -> swift_failure_count={swift_failure_count} (after update)")
+                        else:
+                            # When forced to System 2, Swift failure streak should not accumulate
+                            swift_failure_count = 0
+                            logger.info("[T1 Counter] Reset swift_failure_count=0 because force_system_2=True (Swift not expected to operate).")
                     
                     if not used_sys2:
                         action = return_result
@@ -501,11 +587,16 @@ def eval(args, task_num, logger):
                         last_time_system2 = step  
                         last_time_system2_steps.append(step)
                         consecutive_system2 += 1
+                        # System 2 takeover breaks consecutive Swift failure streak
+                        if use_sage:
+                            swift_failure_count = 0
+                            logger.info("[T1 Counter] Reset swift_failure_count=0 because System 2 was used.")
                         continue 
                         
                     # action is not None but is not valid, fallback to wait
                     if action is not None and action not in validActions:
                         logger.info(f"action '{action}' is not in validActions; ") 
+                        logger.info("[T1 Counter] Swift returned invalid action; queued 'wait' in buffer (counter will reset once buffer action executes).")
                         action = "wait"
                         action_buffer.append(action)
                         obs_buffer.append(action)
@@ -596,8 +687,13 @@ def eval(args, task_num, logger):
             recent_locs.append(current_place)
             
             # === AMM HOOK: POST-STEP WRITE (BEFORE any score modifications) ===
-            # Write memory with TRUE reward/score values from environment
+            # Write memory with TRUE reward/score values from environment (only when use_amm=True)
+            if use_amm and amm_client is not None and wm is not None:
             try:
+                    from amm.writer import write_success, write_nearmiss, write_avoidance, create_memory_record
+                    from amm.config import DEFAULT_CONFIG
+                    from amm.tagging import classify_episode
+                    
                 # Update working memory
                 wm.record_action(action)
                 wm.update_room(current_place)
@@ -685,58 +781,63 @@ def eval(args, task_num, logger):
                 failed_messages.append(f"\t\t Failed action: (in {current_place}) [{action}] --> {obs}")
             
             # === T3 TRIGGER: Repeated Invalid Action (Retrieval B - Avoidance EMs) ===
-            INVALID_OBS = "No known action matches that input."
-            if (
-                amm_client is not None
-                and DEFAULT_CONFIG.enable_em_retrieval
-                and DEFAULT_CONFIG.enable_t3_retrieval
-                and len(recent_actions) >= 2
-                and len(recent_obs) >= 1
-            ):
-                last_action = recent_actions[-1]
-                prev_action = recent_actions[-2]
-                last_obs = recent_obs[-1].strip()
+            # Only active when use_amm=True
+            if use_amm and amm_client is not None and wm is not None:
+                from amm.config import DEFAULT_CONFIG
+                from amm.retrieval import build_avoidance_retrieval_query_b, retrieve_avoidance_ems_b
+                from amm.formatters import _parse_inventory_text
                 
-                is_invalid_obs = (last_obs == INVALID_OBS)
-                is_repeated_action = (last_action == prev_action)
-                
-                if is_invalid_obs and is_repeated_action:
-                    logger.info(
-                        "[T3 Trigger] Repeated invalid action '%s' with observation '%s' "
-                        "→ retrieving avoidance (B) EMs",
-                        last_action,
-                        last_obs,
-                    )
+                INVALID_OBS = "No known action matches that input."
+                if (
+                    DEFAULT_CONFIG.enable_em_retrieval
+                    and DEFAULT_CONFIG.enable_t3_retrieval
+                    and len(recent_actions) >= 2
+                    and len(recent_obs) >= 1
+                ):
+                    last_action = recent_actions[-1]
+                    prev_action_t3 = recent_actions[-2]  # Local variable to avoid clobbering outer prev_action
+                    last_obs = recent_obs[-1].strip()
                     
-                    current_room = get_current_room(info['look']) or "unknown"
-                    inventory_items = _parse_inventory_text(env.inventory())
+                    is_invalid_obs = (last_obs == INVALID_OBS)
+                    is_repeated_action = (last_action == prev_action_t3)
                     
-                    rewards_window = recent_reward[-5:] if len(recent_reward) > 5 else recent_reward
-                    actions_window = recent_actions[-5:] if len(recent_actions) > 5 else recent_actions
-                    obs_window = recent_obs[-5:] if len(recent_obs) > 5 else recent_obs
-                    
-                    query_b = build_avoidance_retrieval_query_b(
-                        task_description=task_description,
-                        room_name=current_room,
-                        inventory_items=inventory_items,
-                        recent_rewards=rewards_window,
-                        current_score=score_true,
-                        look_description=info['look'],
-                        recent_actions=actions_window,
-                        recent_observations=obs_window,
-                    )
-                    
-                    avoidance_ems = retrieve_avoidance_ems_b(
-                        memory_agent_id=amm_client.agent_id,
-                        query_text=query_b,
-                        letta_client=amm_client,
-                    )
-                    
-                    wm.set_avoidance_memories(avoidance_ems)
-                    logger.info(
-                        "[T3 Trigger] Stored %d avoidance EMs in WorkingMemory",
-                        len(avoidance_ems),
-                    )
+                    if is_invalid_obs and is_repeated_action:
+                        logger.info(
+                            "[T3 Trigger] Repeated invalid action '%s' with observation '%s' "
+                            "→ retrieving avoidance (B) EMs",
+                            last_action,
+                            last_obs,
+                        )
+                        
+                        current_room = get_current_room(info['look']) or "unknown"
+                        inventory_items = _parse_inventory_text(env.inventory())
+                        
+                        rewards_window = recent_reward[-5:] if len(recent_reward) > 5 else recent_reward
+                        actions_window = recent_actions[-5:] if len(recent_actions) > 5 else recent_actions
+                        obs_window = recent_obs[-5:] if len(recent_obs) > 5 else recent_obs
+                        
+                        query_b = build_avoidance_retrieval_query_b(
+                            task_description=task_description,
+                            room_name=current_room,
+                            inventory_items=inventory_items,
+                            recent_rewards=rewards_window,
+                            current_score=score_true,
+                            look_description=info['look'],
+                            recent_actions=actions_window,
+                            recent_observations=obs_window,
+                        )
+                        
+                        avoidance_ems = retrieve_avoidance_ems_b(
+                            memory_agent_id=amm_client.agent_id,
+                            query_text=query_b,
+                            letta_client=amm_client,
+                        )
+                        
+                        wm.set_avoidance_memories(avoidance_ems)
+                        logger.info(
+                            "[T3 Trigger] Stored %d avoidance EMs in WorkingMemory",
+                            len(avoidance_ems),
+                        )
             # ================================================================
             
             # if the focus on is useful (positive reward) we will track it
@@ -834,11 +935,14 @@ def parse_args():
     parser.add_argument("--sbert", action="store_true", default=True)
     parser.add_argument("--no_stop", action="store_true", default=True) 
     parser.add_argument("--slow_agent", action="store_true", default=True) 
-    parser.add_argument("--gpt_version", default="gpt-4", type=str)  
+    parser.add_argument("--gpt_version", default="qwen2.5-1m-instruct", type=str, 
+                        help="LLM model identifier (now used mainly for logging; Qwen via vLLM is default).")  
     parser.add_argument("--local_llm", default="none", type=str)  
     parser.add_argument("--demo_file", default="data_utils/demos.json", type=str)
     parser.add_argument("--debug_var", type=int, default=93)
     parser.add_argument("--use_memory_planning", action="store_true", default=True)
+    parser.add_argument("--use_amm", action="store_true", default=True, help="Enable AMM (Adaptive Memory Module) retrieval and writing")
+    parser.add_argument("--use_sage", action="store_true", default=True, help="Enable Sage/System 2 (requires slow_agent=True)")
     args = parser.parse_args()
     params = vars(args)
     return params

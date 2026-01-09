@@ -214,6 +214,85 @@ def get_em_timestamp(em: Any) -> str:
     return str(ts or "N/A")
 
 
+def build_sage_planning_memories_block(
+    episodic_memories: Sequence[Any],
+    max_ems: int = 5,
+    logger: Optional[Any] = None
+) -> Optional[str]:
+    """
+    Build the Sage Planning memory augmentation block from episodic memories.
+    
+    Args:
+        episodic_memories: List of episodic memory dicts with 'content' and optionally 'timestamp'
+        max_ems: Maximum number of EMs to include (default: 5)
+        logger: Optional logger for logging
+        
+    Returns:
+        Formatted memory block string, or None if no memories
+    """
+    if not episodic_memories:
+        if logger:
+            logger.info("[AMM SageMem] No episodic memories provided; skipping injection")
+        return None
+    
+    # Cap to max_ems
+    ems_to_use = list(episodic_memories[:max_ems])
+    num_received = len(episodic_memories)
+    num_injected = len(ems_to_use)
+    
+    if logger:
+        logger.info(f"[AMM SageMem] Building memory block: {num_received} EMs received, {num_injected} EMs will be injected")
+    
+    # Build the block
+    lines = [
+        "====================",
+        "",
+        "RELEVANT PAST EPISODES (FROM MEMORY)",
+        "",
+        "You are given a small set of past episodes retrieved from memory. These may be from similar tasks or similar states.",
+        "",
+        "Use them as *hints* to answer Questions 1–5 more efficiently.",
+        "",
+        "How to use them:",
+        "",
+        "- Extract actionable patterns: useful objects/containers, common successful subgoals, typical mistake-fixes, and critical \"FOCUS\" timing.",
+        "",
+        "- Prefer the current observations when there is any conflict.",
+        "",
+        "- Do not assume every item mentioned in memory exists in the current run; if missing, propose the closest substitute in this environment.",
+        "",
+        "- Do not invent new focus targets beyond what the task allows.",
+        "",
+        "- You do NOT need to quote memory verbatim; only use the relevant details.",
+        "",
+        "====================",
+        ""
+    ]
+    
+    # Add each EM
+    for i, em in enumerate(ems_to_use, 1):
+        timestamp = get_em_timestamp(em)
+        content = get_em_content(em)
+        
+        # Defensive: ensure we have content
+        if not content:
+            content = str(em) if em else "N/A"
+        
+        lines.append(f"[Memory Episode {i}] timestamp={timestamp}")
+        lines.append("")
+        lines.append(content)
+        lines.append("")
+    
+    lines.append("====================")
+    
+    block = "\n".join(lines)
+    
+    if logger:
+        logger.info(f"[AMM SageMem] Memory block built: {len(block)} chars")
+    
+    return block
+
+
 def format_episodic_memories_for_swift(
     episodic_memories: Sequence[Any],
     max_ems: int = 3,
@@ -232,16 +311,11 @@ def format_episodic_memories_for_swift(
     Returns:
         List of selected episodic memory objects (unchanged, no string conversion)
     """
-    logger.info(
-        f"[AMM SwiftMem] format_episodic_memories_for_swift: received "
-        f"{len(episodic_memories)} EMs (max_ems={max_ems})"
-    )
-    
     # Filter out unstructured EMs before tag bucketing/capping
     structured = [em for em in episodic_memories if is_structured_episodic_memory(em)]
     if len(structured) < len(episodic_memories):
         dropped_count = len(episodic_memories) - len(structured)
-        logger.info(
+        logger.debug(
             f"[AMM SwiftMem] Filtered out {dropped_count} "
             "unstructured EMs before tag bucketing/capping."
         )
@@ -288,11 +362,6 @@ def format_episodic_memories_for_swift(
             )
             continue
     
-    logger.info(
-        f"[AMM SwiftMem] Tag bucket counts: "
-        f"success_like={len(success_like)}, avoidance_like={len(avoidance_like)}"
-    )
-    
     # Build selected list: take from success_like first, then avoidance_like if needed
     selected = []
     
@@ -309,11 +378,6 @@ def format_episodic_memories_for_swift(
         logger.debug(
             f"[AMM SwiftMem] {remaining_slots} slots remaining, "
             f"but not yet filling from avoidance_like (keeping simple for now)"
-        )
-    
-    logger.info(
-        f"[AMM SwiftMem] Selected {len(selected)} EMs for Swift "
-        f"(before summarization / injection)"
     )
     
     # Log details for each selected EM
@@ -326,7 +390,7 @@ def format_episodic_memories_for_swift(
             content_preview = content[:80] + "..." if len(content) > 80 else content
             tags_str = ", ".join(tags) if tags else "N/A"
             
-            logger.info(
+            logger.debug(
                 f"[AMM SwiftMem] EM {i+1}: timestamp={timestamp}, "
                 f"tags=[{tags_str}], content_preview=\"{content_preview}\""
             )
@@ -507,7 +571,7 @@ def compact_em_for_swift(em: Any, idx: int) -> str:
     snippet = " ".join(snippet.split())
     
     # Log the snippet
-    logger.info(f"[AMM SwiftMem] Swift snippet {idx}: {snippet}")
+    logger.debug(f"[AMM SwiftMem] Swift snippet {idx}: {snippet}")
     
     return snippet
 
@@ -580,32 +644,30 @@ def build_swift_memories_block(
     Otherwise, returns augmented input_str with EM block injected before "What action should you do next? </s>".
     
     Args:
-        input_str: Current Swift input string
+        input_str: Current Swift input string (must be full Swift prompt from compose_instance)
         episodic_memories: Optional sequence of episodic memory objects
         trigger_context: Optional context string (e.g., "T1", "T2", "T3") for logging
         
     Returns:
         Augmented input string with memories block, or None if no EMs or injection failed
     """
-    # Entry log - always log when this function is called
-    logger.info(
-        f"[AMM SwiftMem] build_swift_memories_block: input_str_len={len(input_str)}, "
-        f"episodic_memories={len(episodic_memories) if episodic_memories else 0}, "
-        f"trigger_context={trigger_context!r}"
-    )
-    
-    if not episodic_memories:
-        logger.info("[AMM SwiftMem] No episodic memories provided for Swift integration.")
+    # INVARIANT CHECK: Ensure input_str is a real Swift prompt, not a placeholder or task_description
+    marker = "What action should you do next? </s>"
+    if marker not in input_str:
+        logger.warning(
+            f"[AMM SwiftMem] ERROR: Swift EM injection called with non-Swift prompt "
+            f"(missing final question marker). input_str_len={len(input_str)}, "
+            f"trigger_context={trigger_context!r}. Preview: {input_str[:100]}..."
+        )
         return None
     
-    logger.info(
-        f"[AMM SwiftMem] Received {len(episodic_memories)} episodic memories for "
-        "potential Swift integration."
-    )
+    if not episodic_memories:
+        logger.debug("[AMM SwiftMem] No episodic memories provided for Swift integration.")
+        return None
     
     selected = format_episodic_memories_for_swift(episodic_memories, max_ems=3)
     if not selected:
-        logger.info("[AMM SwiftMem] No EMs selected for Swift (after filtering/capping).")
+        logger.debug("[AMM SwiftMem] No EMs selected for Swift (after filtering/capping).")
         return None
     
     # Generate compact snippets for each selected EM
@@ -624,8 +686,6 @@ def build_swift_memories_block(
         logger.warning("[AMM SwiftMem] No valid snippets generated from selected EMs.")
         return None
     
-    logger.info(f"[AMM SwiftMem] Prepared {len(snippets)} Swift-ready EM snippets.")
-    
     # Build the memories block
     # Format: </s> Relevant past episodes (from memory): </s> [snippet1] | [snippet2] | [snippet3] </s>
     mem_block = (
@@ -633,8 +693,6 @@ def build_swift_memories_block(
         " | ".join(snippets) +
         " </s> "
     )
-    
-    logger.info(f"[AMM SwiftMem] Swift EM block:\n{mem_block}")
     
     # Inject into input_str right before "What action should you do next? </s>"
     marker = "What action should you do next? </s>"
@@ -650,8 +708,8 @@ def build_swift_memories_block(
     augmented_input_str = input_str.replace(marker, mem_block + marker, 1)
     
     logger.info(
-        f"[AMM SwiftMem] Injected EM block into Swift prompt "
-        f"(original length: {len(input_str)}, new length: {len(augmented_input_str)})."
+        f"[AMM SwiftMem] Injected {len(snippets)} EMs into Swift prompt "
+        f"(len: {len(input_str)} → {len(augmented_input_str)}, trigger: {trigger_context})"
     )
     
     return augmented_input_str
