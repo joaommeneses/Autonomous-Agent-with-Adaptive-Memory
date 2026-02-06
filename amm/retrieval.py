@@ -381,8 +381,18 @@ def retrieve_success_ems_s1(
     Raises:
         Exception: If retrieval fails
     """
-    logger.info("[AMM Retrieval] Starting S1 retrieval via passages.search")
-    logger.info(f"[AMM Retrieval] Query:\n{query_text}")
+    logger.info("[AMM Retrieval] S1 start (success-only) via passages.search")
+    # Extract key fields from query for summary
+    query_len = len(query_text)
+    tags_hint = "episodic_success" if "TAGS_HINT: episodic_success" in query_text else "N/A"
+    if "ISSUE: \"swift_failure\"" in query_text:
+        issue = "swift_failure"
+    elif "ISSUE: \"stagnation_no_progress\"" in query_text:
+        issue = "stagnation"
+    else:
+        issue = "N/A"
+    logger.info(f"[AMM Retrieval] S1 query_len={query_len} tags_hint=[{tags_hint}] issue={issue}")
+    logger.debug(f"[AMM Retrieval] S1 full query:\n{query_text}")
     
     try:
         # Call Letta using passages.search API via client method
@@ -394,7 +404,7 @@ def retrieve_success_ems_s1(
         dropped = raw_count - len(structured_passages)
         
         if dropped > 0:
-            logger.info(
+            logger.debug(
                 f"[AMM Retrieval] Dropped {dropped}/{raw_count} legacy/unstructured EMs "
                 "before dedup (missing TASK/STATE)."
             )
@@ -410,13 +420,18 @@ def retrieve_success_ems_s1(
         deduped_passages = dedup_memories_by_content(structured_passages)
         deduped_count = len(deduped_passages)
         
-        if deduped_count != original_count:
-            logger.info(
-                f"[AMM Retrieval] Deduplicated S1 memories by content: "
-                f"{original_count} → {deduped_count}"
-            )
+        logger.info(f"[AMM Retrieval] S1 results: raw={raw_count}, dedup={deduped_count}")
         
-        logger.info(f"[AMM Retrieval] Retrieved {deduped_count} episodic memory passages (S1: success-only)")
+        # Log short previews (max 2 passages)
+        for i, passage in enumerate(deduped_passages[:2]):
+            try:
+                content = get_em_content(passage)
+                preview = content[:160].replace("\n", " ").strip()
+                logger.info(f"[AMM Retrieval] S1 preview[{i}]={preview}...")
+            except Exception:
+                logger.debug(f"[AMM Retrieval] S1 preview[{i}] failed to extract")
+        
+        logger.info(f"[AMM Retrieval] S1 done: returning {deduped_count} memories")
         
         return deduped_passages
         
@@ -445,8 +460,13 @@ def retrieve_success_ems_s2(
     Raises:
         Exception: If retrieval fails
     """
-    logger.info("[AMM Retrieval] Starting S2 retrieval via passages.search (success + near-miss)")
-    logger.info(f"[AMM Retrieval] Query:\n{query_text}")
+    logger.info("[AMM Retrieval] S2 start (success+nearmiss) via passages.search")
+    # Extract key fields from query for summary
+    query_len = len(query_text)
+    tags_hint = "episodic_success, episodic_nearmiss" if "episodic_nearmiss" in query_text else "episodic_success"
+    issue = "swift_failure" if "ISSUE: \"swift_failure\"" in query_text else ("stagnation" if "ISSUE: \"stagnation\"" in query_text else "N/A")
+    logger.info(f"[AMM Retrieval] S2 query_len={query_len} tags_hint=[{tags_hint}] issue={issue}")
+    logger.debug(f"[AMM Retrieval] S2 full query:\n{query_text}")
     
     try:
         # Call Letta using passages.search API via client method
@@ -458,7 +478,7 @@ def retrieve_success_ems_s2(
         dropped = raw_count - len(structured_passages)
         
         if dropped > 0:
-            logger.info(
+            logger.debug(
                 f"[AMM Retrieval] Dropped {dropped}/{raw_count} legacy/unstructured EMs "
                 "before dedup (missing TASK/STATE)."
             )
@@ -474,18 +494,18 @@ def retrieve_success_ems_s2(
         deduped_passages = dedup_memories_by_content(structured_passages)
         deduped_count = len(deduped_passages)
         
-        if deduped_count != original_count:
-            logger.info(
-                f"[AMM Retrieval] Deduplicated S2 memories by content: "
-                f"{original_count} → {deduped_count}"
-            )
+        logger.info(f"[AMM Retrieval] S2 results: raw={raw_count}, dedup={deduped_count}")
         
-        logger.info(f"[AMM Retrieval] Retrieved {deduped_count} episodic memory passages (S2: success + near-miss)")
+        # Log short previews (max 2 passages)
+        for i, passage in enumerate(deduped_passages[:2]):
+            try:
+                content = get_em_content(passage)
+                preview = content[:160].replace("\n", " ").strip()
+                logger.info(f"[AMM Retrieval] S2 preview[{i}]={preview}...")
+            except Exception:
+                logger.debug(f"[AMM Retrieval] S2 preview[{i}] failed to extract")
         
-        # Log retrieved passages in a clean format
-        for i, passage in enumerate(deduped_passages):
-            passage_preview = json.dumps(passage, indent=2)[:300] + "..." if len(json.dumps(passage)) > 300 else json.dumps(passage, indent=2)
-            logger.info(f"[AMM Retrieval] Passage {i+1}:\n{passage_preview}")
+        logger.info(f"[AMM Retrieval] S2 done: returning {deduped_count} memories")
         
         return deduped_passages
         
@@ -514,8 +534,13 @@ def retrieve_avoidance_ems_b(
     Raises:
         Exception: If retrieval fails
     """
-    logger.info("[AMM Retrieval] Starting B (avoidance) retrieval via passages.search")
-    logger.info(f"[AMM Retrieval] Query:\n{query_text}")
+    logger.info("[AMM Retrieval] B start (avoidance) via passages.search")
+    # Extract key fields from query for summary
+    query_len = len(query_text)
+    tags_hint = "avoidance" if "TAGS_HINT: avoidance" in query_text else "N/A"
+    issue = "repeated_invalid" if "ISSUE:" in query_text else "N/A"
+    logger.info(f"[AMM Retrieval] B query_len={query_len} tags_hint=[{tags_hint}] issue={issue}")
+    logger.debug(f"[AMM Retrieval] B full query:\n{query_text}")
     
     try:
         # Call Letta using passages.search API via client method
@@ -527,7 +552,7 @@ def retrieve_avoidance_ems_b(
         dropped = raw_count - len(structured_passages)
         
         if dropped > 0:
-            logger.info(
+            logger.debug(
                 f"[AMM Retrieval] Dropped {dropped}/{raw_count} legacy/unstructured EMs "
                 "before dedup (missing TASK/STATE)."
             )
@@ -543,18 +568,18 @@ def retrieve_avoidance_ems_b(
         deduped_passages = dedup_memories_by_content(structured_passages)
         deduped_count = len(deduped_passages)
         
-        if deduped_count != original_count:
-            logger.info(
-                f"[AMM Retrieval] Deduplicated B memories by content: "
-                f"{original_count} → {deduped_count}"
-            )
+        logger.info(f"[AMM Retrieval] B results: raw={raw_count}, dedup={deduped_count}")
         
-        logger.info(f"[AMM Retrieval] Retrieved {deduped_count} episodic memory passages (B: avoidance)")
+        # Log short previews (max 2 passages)
+        for i, passage in enumerate(deduped_passages[:2]):
+            try:
+                content = get_em_content(passage)
+                preview = content[:160].replace("\n", " ").strip()
+                logger.info(f"[AMM Retrieval] B preview[{i}]={preview}...")
+            except Exception:
+                logger.debug(f"[AMM Retrieval] B preview[{i}] failed to extract")
         
-        # Log retrieved passages in a clean format
-        for i, passage in enumerate(deduped_passages):
-            passage_preview = json.dumps(passage, indent=2)[:300] + "..." if len(json.dumps(passage)) > 300 else json.dumps(passage, indent=2)
-            logger.info(f"[AMM Retrieval] Passage {i+1}:\n{passage_preview}")
+        logger.info(f"[AMM Retrieval] B done: returning {deduped_count} memories")
         
         return deduped_passages
         

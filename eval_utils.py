@@ -139,9 +139,9 @@ def load_model(args, device):
         use_safetensors=use_safetensors,
     )
 
-    lm_model.eval()
+    lm_model.eval() 
     lm_model.to(device)
-
+    
     sbert_model = SentenceTransformer("paraphrase-MiniLM-L6-v2") if args["sbert"] else None
 
     # local_llm logic unchanged
@@ -173,10 +173,10 @@ def load_variation(env, args, task_num, logger):
     #         variations = variations[:test_len]
     # New condition, that matches paper eval method
     # Use the number of variations if less than 10, use 10 if more than 10
-    elif (args["set"] == "test"):
+    elif (args["set"] == "test"):               
         variations = list(env.getVariationsTest())
         # Test configuration: use only 3 variations
-        variations = variations[:3]
+        variations = variations[: min(10, len(variations))]
     elif (args["set"] == "dev"):
         variations = list(env.getVariationsDev()) 
         variations = variations[:3]
@@ -247,7 +247,13 @@ def findValidActionNew(predictions, env, look, recent_actions, sbert_model, logg
         logger.info(f"No valid action found in top k={k} predictions.")
         validActions = list(validActions)
         validActions.sort(key=lambda x: len(x))
-        logger.info("Valid Predictions: "+ str(validActions)) 
+        # Truncate validActions logging to first 10 + count
+        n_total = len(validActions)
+        first_10 = validActions[:10]
+        if n_total > 10:
+            logger.info(f"[ValidActions] n={n_total}, first10={first_10} (+{n_total-10} more)")
+        else:
+            logger.info(f"[ValidActions] n={n_total}, items={validActions}") 
  
 
     # 2) else, find most similar action
@@ -562,13 +568,14 @@ def rerun_swift_with_same_context(
     input_str = sanitizeStr(input_str)
     
     # Integrate episodic memories for Swift
-    if retrieved_ems:
+    # FAIL-SAFE: Only inject if we have EMs and injection succeeds
+    if retrieved_ems and len(retrieved_ems) > 0:
         try:
             from amm.formatters import build_swift_memories_block
             # Invariant check: Ensure input_str is a real Swift prompt before injection
             if "What action should you do next? </s>" not in input_str:
-                logger.warning(
-                    "[AMM SwiftMem] ERROR: Swift EM injection called with non-Swift prompt "
+                logger.debug(
+                    "[AMM SwiftMem] Swift EM injection called with non-Swift prompt "
                     f"(missing final question, T1-second-pass). input_str_len={len(input_str)}. Not injecting."
                 )
             else:
@@ -580,10 +587,11 @@ def rerun_swift_with_same_context(
                 # CRITICAL: Only use augmented if it's not None (prevents overwriting with memory-only content)
                 if augmented_input is not None:
                     input_str = augmented_input
-                else:
-                    logger.debug("[AMM SwiftMem] EM injection returned None (T1-second-pass), using original prompt")
+                # If augmented_input is None, we silently use original prompt (baseline-equivalent)
         except Exception as e:
+            # FAIL-SAFE: Log error but don't fail - continue with baseline prompt
             logger.debug(f"[T1 Trigger] Swift memory integration failed (non-critical): {e}")
+    # If retrieved_ems is empty/None, we proceed with baseline prompt (no injection, no warning)
     
     # Call Swift model to get predictions
     predStrs = get_model_output(args, input_str, tokenizer, lm_model, device, logger)
@@ -604,17 +612,17 @@ def rerun_swift_with_same_context(
             found_valid_in_top = True
             break
     
-    # BASELINE DEBUG LOGS
-    logger.info(f"[Swift Baseline] Second pass - predictions top-1: {predStrs[0].strip() if predStrs else 'N/A'}")
-    logger.info(f"[Swift Baseline] Second pass - after try_to_replace: {action}")
-    logger.info(f"[Swift Baseline] Second pass - membership check: {action in validActions if action else False}")
-    logger.info(f"[Swift Baseline] Second pass - found_valid_in_top={found_valid_in_top}, final action={action}")
+    # BASELINE DEBUG LOGS (downgraded to DEBUG to reduce noise)
+    logger.debug(f"[Swift Baseline] Second pass - predictions top-1: {predStrs[0].strip() if predStrs else 'N/A'}")
+    logger.debug(f"[Swift Baseline] Second pass - after try_to_replace: {action}")
+    logger.debug(f"[Swift Baseline] Second pass - membership check: {action in validActions if action else False}")
+    logger.debug(f"[Swift Baseline] Second pass - found_valid_in_top={found_valid_in_top}, final action={action}")
     
     # BASELINE CONTRACT: found_valid_in_top must reflect whether Swift produced an action actually in validActions.
     # We do NOT force it True for invalid actions, even though the outer loop may fallback to "wait".
     # This allows escalation (System 2) to trigger correctly when second Swift pass also fails.
     if action is not None and not found_valid_in_top:
-        logger.info(f"[Swift Baseline] Second pass - Action '{action}' NOT in validActions; found_valid_in_top=False (will escalate to System 2)")
+        logger.debug(f"[Swift Baseline] Second pass - Action '{action}' NOT in validActions; found_valid_in_top=False (will escalate to System 2)")
     
     return action, found_valid_in_top
 
@@ -665,6 +673,7 @@ def findValidActionWithSystem2(
     amm_client=None, current_score=None, recent_scores=None,
     swift_failure_count: int = 0,
     cycles_without_progress: int = 0,  # For T2 (stagnation) trigger
+    force_system_2_reason: str = None,  # Reason for forcing System 2 (e.g., "focus_gate", "stuck_or_failed")
     # Parameters for second Swift pass (T1-S2 retry)
     args=None, tokenizer=None, lm_model=None, device=None,
     compose_instance=None, prev_action=None, prev_obs=None,
@@ -688,42 +697,43 @@ def findValidActionWithSystem2(
             found_valid_in_top = True
             break
     
-    # BASELINE DEBUG LOGS
-    logger.info(f"[Swift Baseline] predictions top-1: {predictions[0].strip() if predictions else 'N/A'}")
-    logger.info(f"[Swift Baseline] after try_to_replace: {action}")
-    logger.info(f"[Swift Baseline] membership check: {action in validActions if action else False}")
-    logger.info(f"[Swift Baseline] found_valid_in_top={found_valid_in_top}, final action={action}")
+    # BASELINE DEBUG LOGS (downgraded to DEBUG to reduce noise)
+    logger.debug(f"[Swift Baseline] predictions top-1: {predictions[0].strip() if predictions else 'N/A'}")
+    logger.debug(f"[Swift Baseline] after try_to_replace: {action}")
+    logger.debug(f"[Swift Baseline] membership check: {action in validActions if action else False}")
+    logger.debug(f"[Swift Baseline] found_valid_in_top={found_valid_in_top}, final action={action}")
     
     # BASELINE CONTRACT: found_valid_in_top must reflect whether Swift produced an action actually in validActions.
     # We do NOT force it True for invalid actions, even though the outer loop may fallback to "wait".
     # This allows escalation (T1 retrieval + System 2) to trigger correctly when Swift fails.
     if action is not None and not found_valid_in_top:
-        logger.info(f"[Swift Baseline] Action '{action}' NOT in validActions; found_valid_in_top=False (escalation will trigger)")
+        logger.debug(f"[Swift Baseline] Action '{action}' NOT in validActions; found_valid_in_top=False (escalation will trigger)")
 
     # === T1 TRIGGER: Episodic Memory Retrieval (Template A, S1 → S2 → Sage) ===
     # T1 Escalation Ladder: Within a single failure event, try S1 → S2 → Sage
     # When Swift fails to find a valid action, retrieve success EMs and retry Swift
     # Only escalate to Sage/T4 after all T1 stages have been attempted
+    # NOTE: swift_failure_count is tracked for metrics/debugging but does NOT control T1 ladder execution
+    # Bypass T1 if forcing System 2 due to focus gating (Swift produced valid action, just filtered)
     if not found_valid_in_top and amm_client is not None:
-        try:
-            from amm.retrieval import (
-                build_success_retrieval_query_s1, retrieve_success_ems_s1,
-                build_success_retrieval_query_s2, retrieve_success_ems_s2
-            )
-            from amm.formatters import _parse_inventory_text
-            from amm.config import DEFAULT_CONFIG
-            
-            # Check if EM retrieval is enabled
-            if not DEFAULT_CONFIG.enable_em_retrieval:
-                logger.debug("[T1] EM retrieval is disabled (enable_em_retrieval=False), skipping retrieval")
-            else:
-                # Determine starting stage based on swift_failure_count
-                # swift_failure_count == 0: start at S1, allow S2 fallback
-                # swift_failure_count == 1: start at S2, skip S1
-                # swift_failure_count >= 2: skip T1 entirely, go to Sage
-                if swift_failure_count >= 2:
-                    logger.info(f"[T1] Skipping T1 retrieval; swift_failure_count={swift_failure_count} → escalating to Sage (T4)")
+        # Skip T1 if forcing System 2 due to focus gating (not a true Swift failure)
+        if force_system_2 and force_system_2_reason == "focus_gate":
+            logger.info("[T1] Bypassing T1 ladder (force_system_2=True, reason=focus_gate) → going directly to Sage (T4)")
+        else:
+            try:
+                from amm.retrieval import (
+                    build_success_retrieval_query_s1, retrieve_success_ems_s1,
+                    build_success_retrieval_query_s2, retrieve_success_ems_s2
+                )
+                from amm.formatters import _parse_inventory_text
+                from amm.config import DEFAULT_CONFIG
+                
+                # Check if EM retrieval is enabled
+                if not DEFAULT_CONFIG.enable_em_retrieval:
+                    logger.debug("[T1] EM retrieval is disabled (enable_em_retrieval=False), skipping retrieval")
                 else:
+                    logger.info(f"[T1] Swift failed → starting T1 ladder (S1→S2→Sage) [swift_failure_count={swift_failure_count} for metrics only]")
+                    
                     # Build shared state for retrieval queries
                     retrieval_state = _build_retrieval_state(
                         env, look, recent_reward, recent_scores, current_score,
@@ -744,135 +754,138 @@ def findValidActionWithSystem2(
                     )
                     
                     # === STAGE S1: Success-only EMs ===
-                    # Only attempt S1 if swift_failure_count == 0
-                    s1_succeeded = False
-                    if swift_failure_count == 0:
-                        logger.info(f"[T1] Swift failed → starting escalation (swift_failure_count={swift_failure_count})")
-                        logger.info("[T1] Stage=S1: Retrieving success-only EMs")
-                        
-                        query_s1 = build_success_retrieval_query_s1(
+                    # Always attempt S1 first (regardless of swift_failure_count)
+                    logger.info("[T1] Stage=S1 start: retrieving success-only EMs")
+                    
+                    query_s1 = build_success_retrieval_query_s1(
+                        task_description=task_description,
+                        room_name=current_room,
+                        inventory_items=inventory_items,
+                        recent_rewards=recent_rewards_window,
+                        current_score=current_score_val,
+                        look_description=look,
+                        recent_actions=recent_actions_window,
+                        recent_observations=recent_obs_window,
+                    )
+                    retrieved_ems_s1 = retrieve_success_ems_s1(
+                        memory_agent_id=amm_client.agent_id,
+                        query_text=query_s1,
+                        letta_client=amm_client,
+                    )
+                    logger.info(f"[T1] Stage=S1 retrieved {len(retrieved_ems_s1)} EMs")
+                    
+                    # If no EMs, skip injection and proceed to next stage
+                    if len(retrieved_ems_s1) == 0:
+                        logger.info("[T1] Stage=S1: 0 EMs → skip injection")
+                    
+                    # Retry Swift with S1 EMs (even if EMs list is empty - Swift may still produce valid action)
+                    s1_action = None
+                    s1_found_valid = False
+                    if can_retry_swift:
+                        logger.debug(f"[T1] Stage=S1: Retrying Swift with {len(retrieved_ems_s1)} EMs")
+                        s1_action, s1_found_valid = rerun_swift_with_same_context(
                             task_description=task_description,
-                            room_name=current_room,
-                            inventory_items=inventory_items,
-                            recent_rewards=recent_rewards_window,
+                            look=look,
+                            inventory=inventory,
+                            recent_actions=recent_actions,
+                            recent_obs=recent_obs,
+                            recent_locs=recent_locs,
+                            recent_looks=recent_looks,
+                            failed_messages=failed_messages,
+                            logger=logger,
+                            sbert_model=sbert_model,
+                            step=step,
+                            validActions=validActions,
+                            args=args,
+                            tokenizer=tokenizer,
+                            lm_model=lm_model,
+                            device=device,
+                            compose_instance=compose_instance,
+                            prev_action=prev_action if prev_action is not None else "",
+                            prev_obs=prev_obs if prev_obs is not None else "",
+                            objects=objects if objects is not None else [],
+                            places=places if places is not None else [],
                             current_score=current_score_val,
-                            look_description=look,
-                            recent_actions=recent_actions_window,
-                            recent_observations=recent_obs_window,
+                            retrieved_ems=retrieved_ems_s1,
                         )
-                        retrieved_ems_s1 = retrieve_success_ems_s1(
-                            memory_agent_id=amm_client.agent_id,
-                            query_text=query_s1,
-                            letta_client=amm_client,
-                        )
-                        logger.info(f"[T1] Stage=S1: Retrieved {len(retrieved_ems_s1)} EMs")
+                        logger.info(f"[T1] Stage=S1 Swift retry: success={s1_found_valid}, action='{s1_action or None}'")
                         
-                        # Retry Swift with S1 EMs
-                        if retrieved_ems_s1 and can_retry_swift:
-                            logger.info("[T1] Stage=S1: Retrying Swift with S1 EMs")
-                            s1_action, s1_found_valid = rerun_swift_with_same_context(
-                                task_description=task_description,
-                                look=look,
-                                inventory=inventory,
-                                recent_actions=recent_actions,
-                                recent_obs=recent_obs,
-                                recent_locs=recent_locs,
-                                recent_looks=recent_looks,
-                                failed_messages=failed_messages,
-                                logger=logger,
-                                sbert_model=sbert_model,
-                                step=step,
-                                validActions=validActions,
-                                args=args,
-                                tokenizer=tokenizer,
-                                lm_model=lm_model,
-                                device=device,
-                                compose_instance=compose_instance,
-                                prev_action=prev_action if prev_action is not None else "",
-                                prev_obs=prev_obs if prev_obs is not None else "",
-                                objects=objects if objects is not None else [],
-                                places=places if places is not None else [],
-                                current_score=current_score_val,
-                                retrieved_ems=retrieved_ems_s1,
-                            )
-                            
-                            logger.info(f"[T1] Stage=S1: Swift retry valid? {s1_found_valid} (action={s1_action})")
-                            if s1_found_valid and s1_action is not None:
-                                logger.info(f"[T1] Stage=S1: Success → using fast action '{s1_action}'")
-                                return False, s1_action, True  # Swift succeeded, counter should reset
-                            else:
-                                logger.info("[T1] Stage=S1: Failed → continuing to Stage S2")
-                        elif not retrieved_ems_s1:
-                            logger.info("[T1] Stage=S1: No EMs retrieved → continuing to Stage S2")
+                        if s1_found_valid and s1_action is not None:
+                            logger.info(f"[T1] Stage=S1: Success → using fast action '{s1_action}'")
+                            return False, s1_action, True  # Swift succeeded, counter should reset
                         else:
-                            logger.debug("[T1] Stage=S1: Missing Swift params → continuing to Stage S2")
+                            logger.info("[T1] Stage=S1: Failed → continuing to Stage S2")
+                    else:
+                        logger.debug("[T1] Stage=S1: Missing Swift params → continuing to Stage S2")
                     
                     # === STAGE S2: Success + near-miss EMs ===
-                    # Attempt S2 if S1 failed (or if swift_failure_count == 1, skip S1)
-                    if not s1_succeeded and swift_failure_count <= 1:
-                        logger.info("[T1] Stage=S2: Retrieving success + near-miss EMs")
-                        
-                        query_s2 = build_success_retrieval_query_s2(
+                    # Attempt S2 only if S1 retry failed (or S1 retry was not possible)
+                    logger.info("[T1] Stage=S2 start: retrieving success+nearmiss EMs")
+                    
+                    query_s2 = build_success_retrieval_query_s2(
+                        task_description=task_description,
+                        room_name=current_room,
+                        inventory_items=inventory_items,
+                        recent_rewards=recent_rewards_window,
+                        current_score=current_score_val,
+                        look_description=look,
+                        recent_actions=recent_actions_window,
+                        recent_observations=recent_obs_window,
+                    )
+                    retrieved_ems_s2 = retrieve_success_ems_s2(
+                        memory_agent_id=amm_client.agent_id,
+                        query_text=query_s2,
+                        letta_client=amm_client,
+                    )
+                    logger.info(f"[T1] Stage=S2 retrieved {len(retrieved_ems_s2)} EMs")
+                    
+                    # If no EMs, skip injection and proceed to Sage
+                    if len(retrieved_ems_s2) == 0:
+                        logger.info("[T1] Stage=S2: 0 EMs → skip injection")
+                    
+                    # Retry Swift with S2 EMs (even if EMs list is empty)
+                    s2_action = None
+                    s2_found_valid = False
+                    if can_retry_swift:
+                        logger.debug(f"[T1] Stage=S2: Retrying Swift with {len(retrieved_ems_s2)} EMs")
+                        s2_action, s2_found_valid = rerun_swift_with_same_context(
                             task_description=task_description,
-                            room_name=current_room,
-                            inventory_items=inventory_items,
-                            recent_rewards=recent_rewards_window,
+                            look=look,
+                            inventory=inventory,
+                            recent_actions=recent_actions,
+                            recent_obs=recent_obs,
+                            recent_locs=recent_locs,
+                            recent_looks=recent_looks,
+                            failed_messages=failed_messages,
+                            logger=logger,
+                            sbert_model=sbert_model,
+                            step=step,
+                            validActions=validActions,
+                            args=args,
+                            tokenizer=tokenizer,
+                            lm_model=lm_model,
+                            device=device,
+                            compose_instance=compose_instance,
+                            prev_action=prev_action if prev_action is not None else "",
+                            prev_obs=prev_obs if prev_obs is not None else "",
+                            objects=objects if objects is not None else [],
+                            places=places if places is not None else [],
                             current_score=current_score_val,
-                            look_description=look,
-                            recent_actions=recent_actions_window,
-                            recent_observations=recent_obs_window,
+                            retrieved_ems=retrieved_ems_s2,
                         )
-                        retrieved_ems_s2 = retrieve_success_ems_s2(
-                            memory_agent_id=amm_client.agent_id,
-                            query_text=query_s2,
-                            letta_client=amm_client,
-                        )
-                        logger.info(f"[T1] Stage=S2: Retrieved {len(retrieved_ems_s2)} EMs")
+                        logger.info(f"[T1] Stage=S2 Swift retry: success={s2_found_valid}, action='{s2_action or None}'")
                         
-                        # Retry Swift with S2 EMs
-                        if retrieved_ems_s2 and can_retry_swift:
-                            logger.info("[T1] Stage=S2: Retrying Swift with S2 EMs")
-                            s2_action, s2_found_valid = rerun_swift_with_same_context(
-                                task_description=task_description,
-                                look=look,
-                                inventory=inventory,
-                                recent_actions=recent_actions,
-                                recent_obs=recent_obs,
-                                recent_locs=recent_locs,
-                                recent_looks=recent_looks,
-                                failed_messages=failed_messages,
-                                logger=logger,
-                                sbert_model=sbert_model,
-                                step=step,
-                                validActions=validActions,
-                                args=args,
-                                tokenizer=tokenizer,
-                                lm_model=lm_model,
-                                device=device,
-                                compose_instance=compose_instance,
-                                prev_action=prev_action if prev_action is not None else "",
-                                prev_obs=prev_obs if prev_obs is not None else "",
-                                objects=objects if objects is not None else [],
-                                places=places if places is not None else [],
-                                current_score=current_score_val,
-                                retrieved_ems=retrieved_ems_s2,
-                            )
-                            
-                            logger.info(f"[T1] Stage=S2: Swift retry valid? {s2_found_valid} (action={s2_action})")
-                            if s2_found_valid and s2_action is not None:
-                                logger.info(f"[T1] Stage=S2: Success → using fast action '{s2_action}'")
-                                return False, s2_action, True  # Swift succeeded, counter should reset
-                            else:
-                                logger.info("[T1] Stage=S2: Failed → all T1 stages exhausted, escalating to Sage (T4)")
-                        elif not retrieved_ems_s2:
-                            logger.info("[T1] Stage=S2: No EMs retrieved → all T1 stages exhausted, escalating to Sage (T4)")
+                        if s2_found_valid and s2_action is not None:
+                            logger.info(f"[T1] Stage=S2: Success → using fast action '{s2_action}'")
+                            return False, s2_action, True  # Swift succeeded, counter should reset
                         else:
-                            logger.debug("[T1] Stage=S2: Missing Swift params → all T1 stages exhausted, escalating to Sage (T4)")
+                            logger.info("[T1] Exhausted (S1+S2 failed) → escalating to Sage (T4)")
                     else:
-                        logger.info("[T1] All T1 stages exhausted → escalating to Sage (T4)")
+                        logger.debug("[T1] Stage=S2: Missing Swift params → escalating to Sage (T4)")
+                        logger.info("[T1] Exhausted (S1+S2 failed) → escalating to Sage (T4)")
                 
-        except Exception as e:
-            logger.warning(f"[T1] Episodic memory retrieval failed: {e}")
+            except Exception as e:
+                logger.warning(f"[T1] Episodic memory retrieval failed: {e}")
     # ================================================================
 
     # === T2 TRIGGER: Stagnation / Lack of Progress Retrieval ===
@@ -891,7 +904,16 @@ def findValidActionWithSystem2(
             from amm.formatters import _parse_inventory_text
             
             # Check if EM retrieval and T2 are enabled
-            if DEFAULT_CONFIG.enable_em_retrieval and getattr(DEFAULT_CONFIG, "enable_t2_retrieval", True):
+            # T2_ENABLED gate: Disable T2 retrieval when enable_t2_retrieval is False
+            T2_ENABLED = DEFAULT_CONFIG.enable_em_retrieval and getattr(DEFAULT_CONFIG, "enable_t2_retrieval", True)
+            
+            # One-time log message when T2 is disabled (only log once per session)
+            if not hasattr(findValidActionWithSystem2, '_t2_disabled_logged'):
+                if not T2_ENABLED:
+                    logger.info("[Pipeline] T2 disabled (stagnation retrieval bypassed)")
+                findValidActionWithSystem2._t2_disabled_logged = True
+            
+            if T2_ENABLED:
                 # Build shared state for retrieval queries (reuse helper)
                 retrieval_state = _build_retrieval_state(
                     env, look, recent_reward, recent_scores, current_score,
@@ -961,6 +983,9 @@ def findValidActionWithSystem2(
                     # We no longer call build_swift_memories_block here with placeholder strings.
                     # TODO: Later merge t2_retrieved_ems with other EMs for Sage planning
                     # For now, T2 only retrieves and logs EMs; wiring into prompts comes in T4
+            else:
+                # T2 is disabled - ensure t2_retrieved_ems stays empty
+                t2_retrieved_ems = []
                     
         except Exception as e:
             logger.warning(f"[T2 Trigger] Episodic memory retrieval failed: {e}")
@@ -1056,6 +1081,8 @@ def findValidActionWithSystem2(
                 "[T4 Trigger] S2 retrieval returned %d episodic memories",
                 len(success_ems),
             )
+            if len(success_ems) == 0:
+                logger.info("[T4] S2 retrieval: 0 EMs → baseline planning prompt")
             episodic_memories_for_planning.extend(success_ems)
             
             avoidance_ems: List[Dict[str, Any]] = []
@@ -1204,10 +1231,20 @@ def findValidActionWithSystem2(
         return False, fb_action, False
 
     if not real_action_list:
-        # secondary fallback
+        # If parsing failed and we got no candidates, behave like baseline: always have a fallback candidate.
+        if not predictions:
+            logger.info("Parsed actions empty. Falling back to ['wait'].")
+            predictions = ["wait"]
+
         fb = try_to_replace(predictions[0], validActions, look, inventory)
-        fb_action = sbert_search([fb], validActions, sbert_model, logger)
-        # Fallback action might be valid, but original Swift failed, so found_valid_in_top=False
+
+        # If SBERT is disabled, don't call sbert_search
+        if sbert_model is not None:
+            fb_action = sbert_search([fb], validActions, sbert_model, logger)
+        else:
+            # simple deterministic fallback if no sbert
+            fb_action = fb if fb in validActions else list(validActions)[0]
+
         return False, fb_action, False
 
     # System 2 succeeded - original Swift failed, so found_valid_in_top=False
@@ -1396,15 +1433,15 @@ def compose_prompt_to_plan(demos, useful_focus_on, task_desc, recent_actions, re
                 if mem_block:
                     logger.info(f"[AMM SageMem] Memory block built successfully ({len(mem_block)} chars)")
                 else:
-                    logger.info("[AMM SageMem] Memory block is None (no valid EMs after processing)")
+                    logger.debug("[AMM SageMem] Memory block is None (no valid EMs after processing)")
         except Exception as e:
+            # FAIL-SAFE: Log error but don't fail - continue with baseline prompt
             if logger:
-                logger.info(f"[AMM SageMem] Failed to build memory block: {e}")
-                import traceback
-                logger.info(f"[AMM SageMem] Traceback: {traceback.format_exc()}")
+                logger.debug(f"[AMM SageMem] Failed to build memory block (non-critical): {e}")
+            mem_block = None
     else:
         if logger:
-            logger.info("[AMM SageMem] No episodic memories provided; skipping injection")
+            logger.debug("[AMM SageMem] No episodic memories provided; skipping injection")
     
     if useful_focus_on:
         focus_line = "Importantly, I have FOCUS on these things already: " + ", ".join([fo.replace("focus on", "") for fo in  useful_focus_on])
@@ -1412,19 +1449,18 @@ def compose_prompt_to_plan(demos, useful_focus_on, task_desc, recent_actions, re
         focus_line = "Importantly, I have FOCUS on nothing yet."
     
     # Inject memory block if available and not already present
+    # FAIL-SAFE: Only inject if mem_block is non-empty (None/empty means baseline prompt)
     prompt_str_so_far = "\n".join(prompt_to_plan)
     if mem_block:
         if "RELEVANT PAST EPISODES (FROM MEMORY)" in prompt_str_so_far:
             if logger:
-                logger.info("[AMM SageMem] Memory block already present in prompt; skipping duplicate injection")
+                logger.debug("[AMM SageMem] Memory block already present in prompt; skipping duplicate injection")
         else:
             prompt_to_plan.append(mem_block)
             prompt_to_plan.append("")
             if logger:
                 logger.info(f"[AMM SageMem] Injected memory block into Planning prompt ({len(mem_block)} chars)")
-    elif episodic_memories and not mem_block:
-        if logger:
-            logger.warning("[AMM SageMem] Had episodic memories but mem_block is None; injection skipped")
+    # No else clause needed - if mem_block is None, we proceed with baseline prompt (no injection)
     
     prompt_to_plan.append(focus_line)
     # prompt_to_plan.append("However, my actions so far cannot complete the task. I do not know what to do for the next steps.")

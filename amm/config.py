@@ -21,7 +21,7 @@ class AMMConfig:
     # Control flags for enabling/disabling EM operations (for testing)
     enable_em_write: bool = True  # Set to False to disable episodic memory writing
     enable_em_retrieval: bool = True  # Set to False to disable episodic memory retrieval
-    enable_t2_retrieval: bool = True  # Set to False to disable T2 (stagnation) retrieval
+    enable_t2_retrieval: bool = False  # Set to False to disable T2 (stagnation) retrieval [DISABLED]
     enable_t3_retrieval: bool = True  # Set to False to disable T3 (repeated invalid action) retrieval
     enable_t4_retrieval: bool = True  # Set to False to disable T4 (Sage invocation) retrieval
     

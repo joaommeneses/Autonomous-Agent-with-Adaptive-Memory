@@ -106,7 +106,7 @@ def get_file_name(args, task_num):
 
 
 # ============================================================================
-# BASELINE SWIFT BEHAVIORAL CONTRACT (enforced when use_amm=False, use_sage=False)
+# BASELINE SWIFT BEHAVIORAL CONTRACT (enforced when use_amm=False)
 # ============================================================================
 # Baseline Swift must match original implementation exactly:
 # 1. Prompt: compose_instance_v4() builds prompt with exact structure:
@@ -162,47 +162,49 @@ def eval(args, task_num, logger):
     gpt_version = args["gpt_version"]
     scores = []
 
-    # === FEATURE FLAGS: Control AMM and Sage architecture ===
-    # When both False: baseline Swift-only mode (no AMM, no Sage)
-    use_amm = args.get("use_amm", True)  # Enable AMM retrieval/writing
-    use_sage = args.get("use_sage", True)  # Enable Sage/System 2 (requires slow_agent=True)
+    # === FEATURE FLAGS: Control AMM architecture ===
+    # Sage/System 2 is always enabled (controlled by slow_agent flag)
+    # When use_amm=False: baseline SwiftSage mode (no AMM, but Sage available)
+    use_amm = args.get("use_amm", False)  # Enable AMM retrieval/writing
+    use_sage = True  # Sage/System 2 is always enabled (requires slow_agent=True)
     # =========================================================
 
     # === AMM INIT (only when use_amm=True) ===
     amm_client = None
     wm = None
     if use_amm:
-    from amm.client_letta import AMMLettaClient, LettaConfig
-    from amm.working_memory import WorkingMemory
-    from amm.writer import write_success, write_nearmiss, write_avoidance, create_memory_record
-    from amm.schema import MemoryRecord
-    from amm.config import DEFAULT_CONFIG
-    from amm.tagging import classify_episode
+        from amm.client_letta import AMMLettaClient, LettaConfig
+        from amm.working_memory import WorkingMemory
+        from amm.writer import write_success, write_nearmiss, write_avoidance, create_memory_record
+        from amm.schema import MemoryRecord
+        from amm.config import DEFAULT_CONFIG
+        from amm.tagging import classify_episode
         from amm.retrieval import build_avoidance_retrieval_query_b, retrieve_avoidance_ems_b
         from amm.formatters import _parse_inventory_text
-
-    # Initialize AMM client and working memory
-    # Get API token and agent ID from environment or config
-    letta_api_token = os.getenv("LETTA_API_TOKEN")
-    letta_agent_id = os.getenv("LETTA_AGENT_ID")
+        from amm.config import DEFAULT_CONFIG
     
-    if not letta_api_token or not letta_agent_id:
-        raise ValueError(
-                "LETTA_API_TOKEN and LETTA_AGENT_ID environment variables must be set when use_amm=True. "
-                "Please set them before running the agent, or set use_amm=False for baseline mode."
+        # Initialize AMM client and working memory
+        # Get API token and agent ID from environment or config
+        letta_api_token = os.getenv("LETTA_API_TOKEN")
+        letta_agent_id = os.getenv("LETTA_AGENT_ID")
+        
+        if not letta_api_token or not letta_agent_id:
+            raise ValueError(
+                        "LETTA_API_TOKEN and LETTA_AGENT_ID environment variables must be set when use_amm=True. "
+                        "Please set them before running the agent, or set use_amm=False for baseline mode."
+            )
+        
+        amm_config = LettaConfig(
+            api_token=letta_api_token,
+            agent_id=letta_agent_id,
+            agent_name="memory-agent"
         )
-    
-    amm_config = LettaConfig(
-        api_token=letta_api_token,
-        agent_id=letta_agent_id,
-        agent_name="memory-agent"
-    )
-    amm_client = AMMLettaClient(amm_config)
-    wm = WorkingMemory()
-    logger.info("[AMM] Adaptive Memory Module initialized with Cloud API")
-    logger.info(f"[AMM] Using agent ID: {letta_agent_id}")
+        amm_client = AMMLettaClient(amm_config)
+        wm = WorkingMemory()
+        logger.info("[AMM] Adaptive Memory Module initialized with Cloud API")
+        logger.info(f"[AMM] Using agent ID: {letta_agent_id}")
     else:
-        logger.info("[Baseline] Running in baseline Swift-only mode (use_amm=False, use_sage=False)")
+        logger.info("[Baseline] Running in baseline SwiftSage mode (use_amm=False, Sage available via slow_agent)")
     # =================
 
     for variation in variations:
@@ -216,9 +218,9 @@ def eval(args, task_num, logger):
         
         # === AMM HOOK: EPISODE RESET (only when use_amm=True) ===
         if use_amm and wm is not None:
-        wm.reset()
-        wm.pending_subgoal = task_description
-        logger.info(f"[AMM] Working memory reset for new episode: {task_description[:50]}...")
+            wm.reset()
+            wm.pending_subgoal = task_description
+            logger.info(f"[AMM] Working memory reset for new episode: {task_description[:50]}...")
         # ================================
         # task_description = env.taskdescription()  
         recent_actions = ["look around"]
@@ -288,7 +290,14 @@ def eval(args, task_num, logger):
             validActions = getFilteredValidActions(env, info["look"], task_id=task_num, task_desc=task_description)
             logger.info(f"look = \n {str(info['look'])}")
             logger.info(f"inventory = \n {str(env.inventory())}")
-            logger.info(f"validActions= {validActions}")
+            # Truncate validActions logging to first 10 + count
+            validActions_list = sorted(validActions) if isinstance(validActions, set) else list(validActions)
+            n_total = len(validActions_list)
+            first_10 = validActions_list[:10]
+            if n_total > 10:
+                logger.info(f"[ValidActions] n={n_total}, first10={first_10} (+{n_total-10} more)")
+            else:
+                logger.info(f"[ValidActions] n={n_total}, items={validActions_list}")
             action = None 
             executed = False
 
@@ -480,29 +489,38 @@ def eval(args, task_num, logger):
 
                 # Get valid actions at this point
                 # Heuristic to change systems
+                # Initialize ran_swift_this_step to track if Swift actually ran (for counter updates)
+                ran_swift_this_step = False
+                # Track reason for forcing System 2 (to bypass T1 when appropriate)
+                force_system_2_reason = None
                 if args["slow_agent"]:                    
                     force_system_2 = False 
                     force_system_1 = False 
+                    force_system_2_reason = None
                     # If system 1 is stuck (no action done for 2 steps or two failed actions) switch to system 2
                     if no_action_done >= 2 or len(failed_messages) >= 2:
                         force_system_1 = False
                         force_system_2 = True            
+                        force_system_2_reason = "stuck_or_failed"
                         logger.info("Force to do force_system_2")
                     # If system 1 already focused on something and system 2 did not, switch to system 2
                     if not system_2_focused and system_1_focused_trial >= 1:
                         force_system_1 = False
                         force_system_2 = True            
+                        force_system_2_reason = "focus_gate"  # Focus gating forces System 2
                         logger.info("Force to do force_system_2")
                     # If system 2 has been used for 2 steps, switch to system 1
                     if consecutive_system2 >= 2:
                         force_system_1 = True
                         force_system_2 = False
+                        force_system_2_reason = None
                         logger.info("Force to do force_system_1")
-                    # === BASELINE SWIFT PATH (when use_sage=False) ===
-                    if not use_sage or not args.get("slow_agent", False):
+                    # === BASELINE SWIFT PATH (when slow_agent=False) ===
+                    if not args.get("slow_agent", False):
                         # Baseline Swift-only mode: no Sage, no AMM retrieval
                         input_str = sanitizeStr(input_str)
                         predStrs = get_model_output(args, input_str, tokenizer, lm_model, device, logger)
+                        ran_swift_this_step = True  # Swift ran in baseline path
                         
                         # Baseline action selection: findValidActionNew (no AMM, no Sage)
                         validActions = getFilteredValidActions(env, info['look'], task_id=task_num, task_desc=task_description)
@@ -518,35 +536,43 @@ def eval(args, task_num, logger):
                         used_sys2 = False
                         return_result = action
                         
-                    # === ARCHITECTURE PATH (when use_sage=True and slow_agent=True) ===
+                    # === ARCHITECTURE PATH (when slow_agent=True, Sage always available) ===
                     else:
                         # Use Sage agent (define use_memory_planning here for both Swift and Sage)
                         use_memory_planning = args.get("use_memory_planning", True) and use_amm
 
-                    # if not force_system_2 or force_system_1:
-                    if True:
-                        input_str = sanitizeStr(input_str)
+                        # Determine if we should run Swift this step
+                        # Run Swift if NOT forcing System 2, OR if forcing System 1
+                        ran_swift_this_step = False
+                        predStrs = []  # Initialize predStrs
+                        if not force_system_2 or force_system_1:
+                            input_str = sanitizeStr(input_str)
                             # Invokes Swift, return top predicted actions (baseline SwiftSage - no EM retrieval here)
                             # EM retrieval only happens AFTER Swift fails (T1 trigger in findValidActionWithSystem2)
-                        predStrs = get_model_output(args, input_str, tokenizer, lm_model, device, logger)
-                    else:
-                        predStrs = []
+                            predStrs = get_model_output(args, input_str, tokenizer, lm_model, device, logger)
+                            ran_swift_this_step = True
+                        else:
+                            # Forcing System 2: skip Swift, set empty predictions
+                            predStrs = []
+                            ran_swift_this_step = False
                     
-                        # Use Sage agent with AMM integration
+                        # Always call findValidActionWithSystem2 (it handles both Swift and Sage paths)
+                        # This ensures found_valid_in_top is always defined
                         cycles_without_progress_val = wm.cycles_without_progress if (use_amm and wm is not None) else 0
                         used_sys2, return_result, found_valid_in_top = findValidActionWithSystem2(
-                        predStrs, env, task_num, task_description, info['look'],
-                        recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
-                        demo_data, logger, sbert_model, step, last_time_system2_steps,
-                        useful_focus_on, focus_on_done, force_system_1, force_system_2,
-                        gpt_version, llm=llm,
-                        episodic_memories=None,  # AMM will handle memory retrieval in Phase 2
+                            predStrs, env, task_num, task_description, info['look'],
+                            recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
+                            demo_data, logger, sbert_model, step, last_time_system2_steps,
+                            useful_focus_on, focus_on_done, force_system_1, force_system_2,
+                            gpt_version, llm=llm,
+                            episodic_memories=None,  # AMM will handle memory retrieval in Phase 2
                             use_memory_planning=use_memory_planning,
                             amm_client=amm_client if use_amm else None,  # Pass AMM client only if enabled
                             current_score=score,  # Current score for retrieval query
                             recent_scores=recent_scores,  # Recent scores for retrieval query
                             swift_failure_count=swift_failure_count,  # Pass swift_failure_count for T1 escalation
                             cycles_without_progress=cycles_without_progress_val,  # Pass cycles_without_progress for T2 escalation
+                            force_system_2_reason=force_system_2_reason,  # Pass reason for forcing System 2 (to bypass T1 if focus_gate)
                             # Parameters for second Swift pass (T1-S2 retry)
                             args=args,
                             tokenizer=tokenizer,
@@ -559,19 +585,58 @@ def eval(args, task_num, logger):
                             places=places
                         )
                     
-                    # Update swift_failure_count based on found_valid_in_top (T1 tracks model-level invalidity, not reward)
+                    # Track if action was filtered by focus gating (before counter update)
+                    swift_action_filtered = False
+                    if not used_sys2:
+                        action = return_result
+                        consecutive_system2 = 0
+                        
+                        # Check if this is a focus action that will be filtered by gating
+                        if action and action.startswith("focus on") and not system_2_focused:
+                            # Check if focus gating would reject this action
+                            if system_1_focused_trial < 3 and not any([clean_obj_name(tf) in clean_obj_name(action) for tf in to_focus]):
+                                swift_action_filtered = True
+                                # Try alternative Swift predictions (non-focus actions)
+                                if ran_swift_this_step and predStrs:
+                                    validActions = getFilteredValidActions(env, info['look'], task_id=task_num, task_desc=task_description)
+                                    alternative_action = None
+                                    for pred in predStrs[1:]:  # Try predictions 1, 2, 3...
+                                        pred_repaired = try_to_replace(pred, validActions, info['look'], info['inv'])
+                                        if pred_repaired.strip() in validActions and not pred_repaired.strip().startswith("focus on"):
+                                            alternative_action = pred_repaired.strip()
+                                            logger.info(f"[FocusGate] Selected alternative Swift action='{alternative_action}' after skipping focus")
+                                            action = alternative_action
+                                            swift_action_filtered = False  # Found alternative, not filtered
+                                            break
+                                    
+                                    if swift_action_filtered:
+                                        # No alternative found, will be filtered
+                                        logger.info(f"[FocusGate] Swift proposed valid focus action but it is gated. trial={system_1_focused_trial}, matches_required={any([clean_obj_name(tf) in clean_obj_name(action) for tf in to_focus])}, decision=SKIP")
+                                        # Next iteration will force System 2 due to focus gate, which will bypass T1
+                                        logger.info("[FocusGate] No alternative non-focus action. Next iteration will force System 2 due to focus gate (bypassing T1).")
+                    
+                    # Update swift_failure_count AFTER checking for focus filtering
                     # Only update counter when Swift is actually being used (not forced System 2) and architecture is enabled
                     if use_sage and args.get("slow_agent", False):
-                        if not force_system_2:
-                            if not found_valid_in_top:
+                        if ran_swift_this_step and not force_system_2:
+                            # Swift ran this step and we're not forcing System 2: update counter based on Swift result
+                            if swift_action_filtered:
+                                # Valid action but filtered by focus gating: do NOT increment counter
+                                logger.info(f"[T1 Counter] No increment (reason=valid_but_filtered_focus_gate)")
+                            elif not found_valid_in_top:
+                                # True Swift failure: increment counter
                                 swift_failure_count += 1
+                                logger.info(f"[T1 Counter] Increment swift_failure_count -> {swift_failure_count} (reason=true_swift_failure)")
                             else:
+                                # Swift succeeded: reset counter
+                                # This includes both baseline Swift success and T1 retry success
                                 swift_failure_count = 0
-                            logger.info(f"[T1 Counter] Swift attempt valid_in_top={found_valid_in_top} -> swift_failure_count={swift_failure_count} (after update)")
-                        else:
+                                logger.info(f"[T1 Counter] Reset -> 0 (reason=swift_valid_action_executed)")
+                        elif force_system_2:
                             # When forced to System 2, Swift failure streak should not accumulate
                             swift_failure_count = 0
                             logger.info("[T1 Counter] Reset swift_failure_count=0 because force_system_2=True (Swift not expected to operate).")
+                        # If ran_swift_this_step=False and not force_system_2, counter remains unchanged (shouldn't happen in normal flow)
                     
                     if not used_sys2:
                         action = return_result
@@ -609,6 +674,7 @@ def eval(args, task_num, logger):
                     input_str = sanitizeStr(input_str)
                     logger.info("InputStr: " + input_str)
                     predStrs = get_model_output(args, input_str, tokenizer, lm_model, device, logger)
+                    ran_swift_this_step = True  # Swift ran in Swift-only path
                     
                     # Check if any top prediction is valid (for swift_failure_count tracking)
                     validActions = getFilteredValidActions(env, info['look'], task_id=task_num, task_desc=task_description)
@@ -631,6 +697,10 @@ def eval(args, task_num, logger):
             # Focus action was already executed, continue
             if action.startswith("focus on") and focus_on_done:
                 logger.info(f"You have already done great focus-on action: {useful_focus_on}. Skipping this [{action}]")
+                # Reset counter since this is a valid action (just already done)
+                if use_sage and args.get("slow_agent", False):
+                    swift_failure_count = 0
+                    logger.info("[T1 Counter] Reset -> 0 (reason=valid_action_already_done)")
                 continue 
             
             # Sage handled the focus on action, and we mark the flag to prevent it from trying the same subgoal
@@ -644,9 +714,16 @@ def eval(args, task_num, logger):
                 # only after 3 attempts or if the obeject its focusing on matches the task-relevant focus targets we allow it
                 if system_1_focused_trial >= 3 or any([clean_obj_name(tf) in clean_obj_name(action) for tf in to_focus]):
                     logger.info(f"You have never used System 2 to focus on... but system_1 has tried multiple times... so okay with [{action}]")
+                    # Valid focus action accepted: reset counter (already done in counter update logic above)
                 # otherwise skip action
                 else:
-                    logger.info(f"You have never used System 2 to focus on... so skip [{action}]")
+                    logger.info(f"[FocusGate] Swift proposed valid focus action but it is gated. trial={system_1_focused_trial}, matches_required={any([clean_obj_name(tf) in clean_obj_name(action) for tf in to_focus])}, decision=SKIP")
+                    # Valid action but filtered: counter was already handled in counter update logic above
+                    # Reset force flags for next iteration to avoid sticky state
+                    if use_sage and args.get("slow_agent", False):
+                        # Don't increment counter (already handled above), but ensure next iteration starts fresh
+                        # The next iteration will check system_1_focused_trial and may force System 2, but that's intentional
+                        pass
                     continue 
             
             
@@ -689,86 +766,86 @@ def eval(args, task_num, logger):
             # === AMM HOOK: POST-STEP WRITE (BEFORE any score modifications) ===
             # Write memory with TRUE reward/score values from environment (only when use_amm=True)
             if use_amm and amm_client is not None and wm is not None:
-            try:
+                try:
                     from amm.writer import write_success, write_nearmiss, write_avoidance, create_memory_record
                     from amm.config import DEFAULT_CONFIG
                     from amm.tagging import classify_episode
                     
-                # Update working memory
-                wm.record_action(action)
-                wm.update_room(current_place)
-                wm.update_inventory(env.inventory())
-                
-                # Build goal signature
-                goal_sig = task_description
-                
-                # Build rich context metadata with TRUE values
-                inventory_str = getattr(wm, "inventory_text", None) or str(env.inventory())
-                ctx_meta = {
-                    "room": current_place,
-                    "inventory_text": inventory_str,
-                    "look": info['look'],  # Room description/look string
-                    "recent_actions": recent_actions[-5:] if len(recent_actions) > 5 else recent_actions,
-                    "recent_obs": [o[:100] for o in recent_obs[-5:]] if len(recent_obs) > 5 else [o[:100] for o in recent_obs],
-                    "reward": reward_true,  # TRUE reward from environment
-                    "score_prev": last_score,  # Score before this step
-                    "score_curr": score_true,  # TRUE score from environment (not modified)
-                    "done": bool(done),  # TRUE done flag from environment
-                    "focus_targets": to_focus,
-                }
-                
-                # Create memory record with rich context
-                rec = create_memory_record(
-                    goal_signature=goal_sig,
-                    action_text=action,
-                    obs_text=obs,
-                    meta=ctx_meta
-                )
-
-                # Classify episode using the new tagging system
-                # This determines both primary tag and subtag, and which writer to call
-                try:
-                    result = classify_episode(
-                        action=action,
-                        observation=obs,
-                        reward=reward_true,  # TRUE reward
-                        score_prev=last_score,
-                        score_curr=score_true,  # TRUE score
-                        done=done,  # TRUE done flag
-                        goal_text=goal_sig,
-                        milestone_threshold=DEFAULT_CONFIG.MILESTONE_THRESHOLD,
-                        small_reward_threshold=DEFAULT_CONFIG.SMALL_REWARD_THRESHOLD,
-                        shaping_actions=DEFAULT_CONFIG.SHAPING_ACTIONS
-                    )
+                    # Update working memory
+                    wm.record_action(action)
+                    wm.update_room(current_place)
+                    wm.update_inventory(env.inventory())
                     
-                    # Skip writing if non-eventful or unclassifiable
-                    if result is None:
-                        wm.increment_cycles_without_progress()
-                    else:
-                        primary, subtag = result
+                    # Build goal signature
+                    goal_sig = task_description
+                    
+                    # Build rich context metadata with TRUE values
+                    inventory_str = getattr(wm, "inventory_text", None) or str(env.inventory())
+                    ctx_meta = {
+                        "room": current_place,
+                        "inventory_text": inventory_str,
+                        "look": info['look'],  # Room description/look string
+                        "recent_actions": recent_actions[-5:] if len(recent_actions) > 5 else recent_actions,
+                        "recent_obs": [o[:100] for o in recent_obs[-5:]] if len(recent_obs) > 5 else [o[:100] for o in recent_obs],
+                        "reward": reward_true,  # TRUE reward from environment
+                        "score_prev": last_score,  # Score before this step
+                        "score_curr": score_true,  # TRUE score from environment (not modified)
+                        "done": bool(done),  # TRUE done flag from environment
+                        "focus_targets": to_focus,
+                    }
+                    
+                    # Create memory record with rich context
+                    rec = create_memory_record(
+                        goal_signature=goal_sig,
+                        action_text=action,
+                        obs_text=obs,
+                        meta=ctx_meta
+                    )
+
+                    # Classify episode using the new tagging system
+                    # This determines both primary tag and subtag, and which writer to call
+                    try:
+                        result = classify_episode(
+                            action=action,
+                            observation=obs,
+                            reward=reward_true,  # TRUE reward
+                            score_prev=last_score,
+                            score_curr=score_true,  # TRUE score
+                            done=done,  # TRUE done flag
+                            goal_text=goal_sig,
+                            milestone_threshold=DEFAULT_CONFIG.MILESTONE_THRESHOLD,
+                            small_reward_threshold=DEFAULT_CONFIG.SMALL_REWARD_THRESHOLD,
+                            shaping_actions=DEFAULT_CONFIG.SHAPING_ACTIONS
+                        )
                         
-                        # Call appropriate writer based on primary tag
-                        # The writer will handle embedding tags into content
-                        if primary == "episodic_success":
-                            write_success(amm_client, rec, meta=ctx_meta)
-                            wm.reset_cycles_without_progress()
-                        elif primary == "episodic_nearmiss":
-                            write_nearmiss(amm_client, rec, meta=ctx_meta)
-                            wm.reset_cycles_without_progress()
-                        elif primary == "avoidance":
-                            write_avoidance(amm_client, rec, meta=ctx_meta)
+                        # Skip writing if non-eventful or unclassifiable
+                        if result is None:
                             wm.increment_cycles_without_progress()
                         else:
-                            # Fallback: should not happen, but handle gracefully
-                            logger.warning(f"[AMM] Unknown primary tag: {primary}, skipping memory write")
-                            wm.increment_cycles_without_progress()
-                        
-                except Exception as e:
-                    logger.warning(f"[AMM] Classification failed, no memory written: {e}")
-                    wm.increment_cycles_without_progress()
+                            primary, subtag = result
+                            
+                            # Call appropriate writer based on primary tag
+                            # The writer will handle embedding tags into content
+                            if primary == "episodic_success":
+                                write_success(amm_client, rec, meta=ctx_meta)
+                                wm.reset_cycles_without_progress()
+                            elif primary == "episodic_nearmiss":
+                                write_nearmiss(amm_client, rec, meta=ctx_meta)
+                                wm.reset_cycles_without_progress()
+                            elif primary == "avoidance":
+                                write_avoidance(amm_client, rec, meta=ctx_meta)
+                                wm.increment_cycles_without_progress()
+                            else:
+                                # Fallback: should not happen, but handle gracefully
+                                logger.warning(f"[AMM] Unknown primary tag: {primary}, skipping memory write")
+                                wm.increment_cycles_without_progress()
+                            
+                    except Exception as e:
+                        logger.warning(f"[AMM] Classification failed, no memory written: {e}")
+                        wm.increment_cycles_without_progress()
 
-            except Exception as e:
-                logger.error(f"[AMM] Memory writing failed: {e}")
+                except Exception as e:
+                    logger.error(f"[AMM] Memory writing failed: {e}")
             # ===============================
             
             # Apply score modifications AFTER memory writing (for display/evaluation only)
@@ -779,6 +856,7 @@ def eval(args, task_num, logger):
             if is_action_failed(obs):
                 logger.info(f"\t\t Failed: [{action}] --> {obs}")
                 failed_messages.append(f"\t\t Failed action: (in {current_place}) [{action}] --> {obs}")
+            
             
             # === T3 TRIGGER: Repeated Invalid Action (Retrieval B - Avoidance EMs) ===
             # Only active when use_amm=True
@@ -941,8 +1019,7 @@ def parse_args():
     parser.add_argument("--demo_file", default="data_utils/demos.json", type=str)
     parser.add_argument("--debug_var", type=int, default=93)
     parser.add_argument("--use_memory_planning", action="store_true", default=True)
-    parser.add_argument("--use_amm", action="store_true", default=True, help="Enable AMM (Adaptive Memory Module) retrieval and writing")
-    parser.add_argument("--use_sage", action="store_true", default=True, help="Enable Sage/System 2 (requires slow_agent=True)")
+    parser.add_argument("--use_amm", action="store_true", default=False, help="Enable AMM (Adaptive Memory Module) retrieval and writing. Sage/System 2 is always available when slow_agent=True.")
     args = parser.parse_args()
     params = vars(args)
     return params

@@ -263,9 +263,10 @@ class AMMLettaClient:
             f"[AMM Letta] Invoking archival_memory_insert: "
             f"content_len={len(content)}"
         )
-        # Log the final content that will be sent (showing tags if present)
-        content_preview = content[:500] + "..." if len(content) > 500 else content
-        logger.info(f"[AMM Letta] Content:\n{content_preview}")
+        # Log only a single-line preview at INFO (full content at DEBUG)
+        content_preview = content[:200].replace("\n", " ").strip()
+        logger.info(f"[AMM Letta] Content preview: {content_preview}...")
+        logger.debug(f"[AMM Letta] Full content:\n{content}")
         
         if not self.agent_id:
             raise RuntimeError("[AMM Letta] agent_id is not set; cannot send memory write.")
@@ -310,7 +311,7 @@ class AMMLettaClient:
             - relevance: Dict with rrf_score, vector_rank, fts_rank
         """
         original_len = len(query)
-        logger.info(f"[AMM Letta] Retrieval requested via passages.search: query_len={original_len}")
+        logger.debug(f"[AMM Letta] Retrieval requested via passages.search: query_len={original_len}")
         
         if not self.agent_id:
             raise RuntimeError("[AMM Letta] agent_id is not set; cannot retrieve memories.")
@@ -318,7 +319,7 @@ class AMMLettaClient:
         # Prepare query for BM25 length limit
         prepared_query = self._prepare_query_for_bm25(query, limit=1024)
         if len(prepared_query) < original_len:
-            logger.warning(
+            logger.debug(
                 f"[AMM Letta] Query trimmed from {original_len} to {len(prepared_query)} chars "
                 "to respect BM25 length limit"
             )
@@ -333,7 +334,7 @@ class AMMLettaClient:
             response = self.client.agents.passages.search(**search_kwargs)
             
             # Debug raw response shape once
-            logger.info(f"[AMM Letta] passages.search raw type: {type(response)}")
+            logger.debug(f"[AMM Letta] passages.search raw type: {type(response)}")
             
             # Extract results from ArchivalMemorySearchResponse object
             if not hasattr(response, "results"):
@@ -341,7 +342,7 @@ class AMMLettaClient:
                 return []
             
             raw_results = response.results
-            logger.info(f"[AMM Letta] Found {len(raw_results)} results (count={getattr(response, 'count', 'unknown')})")
+            logger.debug(f"[AMM Letta] Found {len(raw_results)} results (count={getattr(response, 'count', 'unknown')})")
             
             # Convert each ArchivalMemorySearchResult to dict
             passages = []
@@ -363,19 +364,19 @@ class AMMLettaClient:
             if passages:
                 passages = passages[:top_k]
             
-            # Log a short preview of each passage
+            # Log passage previews at DEBUG level only (retrieval wrapper will log summaries at INFO)
             for i, p in enumerate(passages):
                 try:
                     preview = json.dumps(p, indent=2)[:400] if isinstance(p, dict) else str(p)[:400]
                 except Exception:
                     preview = repr(p)[:400]
-                logger.info(f"[AMM Letta] Passage {i+1} preview: {preview}")
+                logger.debug(f"[AMM Letta] Passage {i+1} preview: {preview}")
             
             return passages
         
         try:
             results = self._retry_with_backoff(_retrieve)
-            logger.info(f"[AMM Letta] Retrieval completed successfully: n={len(results)}")
+            logger.debug(f"[AMM Letta] Retrieval completed successfully: n={len(results)}")
             return results
         except Exception as e:
             logger.exception(f"[AMM Letta] Retrieval failed after retries: {e}")
