@@ -162,11 +162,14 @@ def eval(args, task_num, logger):
     gpt_version = args["gpt_version"]
     scores = []
 
-    # === FEATURE FLAGS: Control AMM architecture ===
+    # === FEATURE FLAGS: Control AMM and SRM architecture ===
     # Sage/System 2 is always enabled (controlled by slow_agent flag)
     # When use_amm=False: baseline SwiftSage mode (no AMM, but Sage available)
     use_amm = args.get("use_amm", False)  # Enable AMM retrieval/writing
     use_sage = True  # Sage/System 2 is always enabled (requires slow_agent=True)
+    enable_srm = args.get("enable_srm", True)  # Enable SRM (Self-Reflection Module)
+    srm_max_candidates = args.get("srm_max_candidates", 200)  # SRM: max candidates to consider
+    srm_recent_window = args.get("srm_recent_window", 5)  # SRM: recent actions window for scoring
     # =========================================================
 
     # === AMM INIT (only when use_amm=True) ===
@@ -1020,6 +1023,9 @@ def parse_args():
     parser.add_argument("--debug_var", type=int, default=93)
     parser.add_argument("--use_memory_planning", action="store_true", default=True)
     parser.add_argument("--use_amm", action="store_true", default=False, help="Enable AMM (Adaptive Memory Module) retrieval and writing. Sage/System 2 is always available when slow_agent=True.")
+    parser.add_argument("--enable_srm", action="store_true", default=True, help="Enable SRM (Self-Reflection Module) for proposing guiding actions.")
+    parser.add_argument("--srm_max_candidates", type=int, default=200, help="SRM: Maximum number of action candidates to consider (hard cap for efficiency).")
+    parser.add_argument("--srm_recent_window", type=int, default=5, help="SRM: Number of recent actions to check for scoring.")
     args = parser.parse_args()
     params = vars(args)
     return params
