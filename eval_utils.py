@@ -23,6 +23,64 @@ from typing import List, Dict, Any
 
 from slow_agent import local_llm
 
+# SRM import - robust import with clear error handling
+srm_propose_action = None
+def _import_srm_module():
+    """Import SRM module with fallback attempts and clear error reporting."""
+    global srm_propose_action
+    if srm_propose_action is not None:
+        return srm_propose_action
+    
+    import sys
+    import traceback
+    
+    # Try primary import path
+    try:
+        from srm.srm_module import propose_action as srm_propose_action
+        return srm_propose_action
+    except ImportError as e1:
+        # Try alternative import path (if srm_module.py is at root)
+        try:
+            import importlib.util
+            import os
+            # Check if srm directory exists
+            srm_path = os.path.join(os.path.dirname(__file__), 'srm', 'srm_module.py')
+            if os.path.exists(srm_path):
+                spec = importlib.util.spec_from_file_location("srm_module", srm_path)
+                srm_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(srm_module)
+                srm_propose_action = srm_module.propose_action
+                return srm_propose_action
+        except Exception as e2:
+            pass
+    
+    # If all imports failed, return None (will be checked later)
+    return None
+
+def _ensure_srm_imported(args, logger):
+    """Ensure SRM is imported if enabled, fail loudly if import fails."""
+    global srm_propose_action
+    
+    # Check if SRM is enabled
+    enable_srm = not bool(args.get("disable_srm", False)) if args else True
+    
+    if not enable_srm:
+        # SRM is disabled, that's fine
+        return None
+    
+    # SRM is enabled - must be importable
+    if srm_propose_action is None:
+        import traceback
+        srm_propose_action = _import_srm_module()
+        
+        if srm_propose_action is None:
+            error_msg = "[SRM][IMPORT] Failed to import SRM module. SRM is enabled, aborting.\n"
+            error_msg += traceback.format_exc()
+            logger.error(error_msg)
+            raise ImportError("SRM module import failed but SRM is enabled. Check SRM installation and paths.")
+    
+    return srm_propose_action
+
 action_type_description = [
     {"action_type": "WAIT()", "desc": "wait for something to be done, for example, an object on stove to be boiled"},
     {"action_type": "TELEPORT(room)", "desc": "directly go to a room such as TELEPORT(kitchen)"},
@@ -176,6 +234,7 @@ def load_variation(env, args, task_num, logger):
     elif (args["set"] == "test"):               
         variations = list(env.getVariationsTest())
         # Test configuration: use only 3 variations
+        # variations = variations[:1]
         variations = variations[: min(10, len(variations))]
     elif (args["set"] == "dev"):
         variations = list(env.getVariationsDev()) 
@@ -585,8 +644,8 @@ def rerun_swift_with_same_context(
                     trigger_context="T1-second-pass"
                 )
                 # CRITICAL: Only use augmented if it's not None (prevents overwriting with memory-only content)
-                if augmented_input is not None:
-                    input_str = augmented_input
+            if augmented_input is not None:
+                input_str = augmented_input
                 # If augmented_input is None, we silently use original prompt (baseline-equivalent)
         except Exception as e:
             # FAIL-SAFE: Log error but don't fail - continue with baseline prompt
@@ -812,7 +871,7 @@ def findValidActionWithSystem2(
                         
                         if s1_found_valid and s1_action is not None:
                             logger.info(f"[T1] Stage=S1: Success → using fast action '{s1_action}'")
-                            return False, s1_action, True  # Swift succeeded, counter should reset
+                            return False, s1_action, True, "swift"  # Swift succeeded, counter should reset
                         else:
                             logger.info("[T1] Stage=S1: Failed → continuing to Stage S2")
                     else:
@@ -877,13 +936,12 @@ def findValidActionWithSystem2(
                         
                         if s2_found_valid and s2_action is not None:
                             logger.info(f"[T1] Stage=S2: Success → using fast action '{s2_action}'")
-                            return False, s2_action, True  # Swift succeeded, counter should reset
+                            return False, s2_action, True, "swift"  # Swift succeeded, counter should reset
                         else:
                             logger.info("[T1] Exhausted (S1+S2 failed) → escalating to Sage (T4)")
                     else:
                         logger.debug("[T1] Stage=S2: Missing Swift params → escalating to Sage (T4)")
                         logger.info("[T1] Exhausted (S1+S2 failed) → escalating to Sage (T4)")
-                
             except Exception as e:
                 logger.warning(f"[T1] Episodic memory retrieval failed: {e}")
     # ================================================================
@@ -1010,8 +1068,74 @@ def findValidActionWithSystem2(
         assert action is not None
         logger.info(f"[Baseline] Using Fast System output: {action}")
         logger.info(f"[Baseline] enable_system2={enable_system2}, force_system_2={force_system_2}")
-        return False, action, found_valid_in_top
+        return False, action, found_valid_in_top, "swift"
 
+    # === SRM TRIGGER: Self-Reflection Module (before System 2 escalation) ===
+    # SRM proposes useful "probe" actions when Swift fails to produce a valid action
+    # SRM runs BEFORE Sage/System 2, and only when AMM is disabled
+    # SRM triggers whenever Swift fails (found_valid_in_top == False)
+    
+    # Check if SRM should be bypassed due to escalation policy
+    srm_no_reward_streak = args.get("srm_no_reward_streak", 0) if args else 0
+    bypass_srm_for_sage = (srm_no_reward_streak >= 2)
+    
+    # Ensure SRM is imported if enabled
+    try:
+        srm_propose_action_func = _ensure_srm_imported(args, logger)
+    except ImportError:
+        # SRM import failed and SRM is enabled - abort
+        raise
+    
+    if srm_propose_action_func is not None:
+        # Read SRM flags from args
+        enable_srm = not bool(args.get("disable_srm", False)) if args else True
+        srm_max_candidates = int(args.get("srm_max_candidates", 200)) if args else 200
+        srm_recent_window = int(args.get("srm_recent_window", 5)) if args else 5
+        
+        # SRM only runs when AMM is OFF (SRM-only phase) and SRM is enabled
+        srm_allowed = enable_srm and (amm_client is None)
+        
+        # SRM triggers when Swift failed to produce a valid action
+        # SRM runs BEFORE Sage, so we don't check force_system_2 here
+        if srm_allowed and not found_valid_in_top and predictions:
+            if bypass_srm_for_sage:
+                logger.info(f"[Policy] escalate_to=Sage reason=srm_streak (srm_no_reward_streak={srm_no_reward_streak})")
+                # Skip SRM, go directly to Sage
+            else:
+                logger.info(f"[SRM] trigger: swift_topK_failed, srm_no_reward_streak={srm_no_reward_streak}")
+                
+                # Log validActions (truncated for readability)
+                valid_actions_list = list(validActions)
+                valid_actions_preview = sorted(valid_actions_list)[:20]
+                logger.info(f"[SRM Trigger] validActions (n={len(valid_actions_list)}): {valid_actions_preview}{'...' if len(valid_actions_list) > 20 else ''}")
+                
+                # Call SRM v2
+                srm_action = srm_propose_action_func(
+                    valid_actions=valid_actions_list,
+                    task_description=task_description,
+                    look=look,
+                    inventory=str(inventory) if inventory else "",
+                    recent_actions=recent_actions,
+                    recent_obs=recent_obs,
+                    max_candidates=srm_max_candidates,
+                    recent_window=srm_recent_window,
+                )
+                
+                if srm_action is not None and srm_action in validActions:
+                    logger.info(f"[SRM] proposed={srm_action}")
+                    # Return action_source="srm" via a special return format
+                    # We'll modify return signature to include action_source
+                    return False, srm_action, False, "srm"  # found_valid_in_top=False, action, found_valid_in_top, action_source
+                else:
+                    logger.info(f"[SRM] proposed=None")
+                    if srm_action is not None:
+                        logger.info(f"[SRM] Proposed action '{srm_action}' not in validActions")
+        elif not srm_allowed and not found_valid_in_top:
+            logger.info(f"[Policy] escalate_to=Sage reason=srm_disabled_or_amm_enabled")
+    elif not found_valid_in_top:
+        logger.info(f"[Policy] escalate_to=Sage reason=srm_none")
+    
+    # Fallback: if SRM didn't run or didn't propose a valid action, try baseline retry
     if ((not found_valid_in_top and (step - last_sys2) <= 2) or force_system_1) and not force_system_2:
         cand_preds = [try_to_replace(p, validActions, look, inventory)
                       for p in predictions if not p.startswith("focus on")]
@@ -1020,7 +1144,8 @@ def findValidActionWithSystem2(
         trial_action = trial_action or (cand_preds[0] if cand_preds else None)
         # trial_action might be valid even if found_valid_in_top was False, so check if trial_action is in validActions
         trial_found_valid = trial_action is not None and trial_action in validActions
-        return False, trial_action, trial_found_valid
+        return False, trial_action, trial_found_valid, "swift"
+    # ================================================================
 
     # System 2
     assert enable_system2 or force_system_2
@@ -1223,12 +1348,19 @@ def findValidActionWithSystem2(
         real_action_list, guess_obs_list = post_process(response_next_actions)
 
     except Exception as e:
-        logger.info("Qwen-vLLM planning error: " + str(e))  # Changed from "Gemini planning error"
-        # fallback to SBERT
+        logger.info("Qwen-vLLM planning error: " + str(e))
+
+        # If we have no Swift predictions, pick a safe deterministic fallback.
+        if not predictions:
+            for cand in ("look", "inventory", "look around", "wait"):
+                if cand in validActions:
+                    return False, cand, False, "swift"
+            # last resort: deterministic pick
+            return False, sorted(list(validActions))[0], False, "swift"
+
         fb = try_to_replace(predictions[0], validActions, look, inventory)
         fb_action = sbert_search([fb], validActions, sbert_model, logger)
-        # Fallback action might be valid, but original Swift failed, so found_valid_in_top=False
-        return False, fb_action, False
+        return False, fb_action, False, "swift"
 
     if not real_action_list:
         # If parsing failed and we got no candidates, behave like baseline: always have a fallback candidate.
@@ -1245,10 +1377,10 @@ def findValidActionWithSystem2(
             # simple deterministic fallback if no sbert
             fb_action = fb if fb in validActions else list(validActions)[0]
 
-        return False, fb_action, False
+        return False, fb_action, False, "swift"
 
     # System 2 succeeded - original Swift failed, so found_valid_in_top=False
-    return True, (real_action_list, guess_obs_list), False
+    return True, (real_action_list, guess_obs_list), False, "sage"
 
 
 
@@ -1284,6 +1416,8 @@ def compose_prompt_to_nextactions(demos, task_desc, recent_actions, recent_obs, 
         if o == "N/A":
             continue 
         fa = formalize_action(a)
+        if not fa:
+            continue
         if "(" not in fa:
             continue
         at = fa[:fa.index("(")]

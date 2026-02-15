@@ -167,7 +167,7 @@ def eval(args, task_num, logger):
     # When use_amm=False: baseline SwiftSage mode (no AMM, but Sage available)
     use_amm = args.get("use_amm", False)  # Enable AMM retrieval/writing
     use_sage = True  # Sage/System 2 is always enabled (requires slow_agent=True)
-    enable_srm = args.get("enable_srm", True)  # Enable SRM (Self-Reflection Module)
+    enable_srm = not args.get("disable_srm", False)  # Enable SRM (Self-Reflection Module), disabled via --disable_srm
     srm_max_candidates = args.get("srm_max_candidates", 200)  # SRM: max candidates to consider
     srm_recent_window = args.get("srm_recent_window", 5)  # SRM: recent actions window for scoring
     # =========================================================
@@ -182,10 +182,7 @@ def eval(args, task_num, logger):
         from amm.schema import MemoryRecord
         from amm.config import DEFAULT_CONFIG
         from amm.tagging import classify_episode
-        from amm.retrieval import build_avoidance_retrieval_query_b, retrieve_avoidance_ems_b
-        from amm.formatters import _parse_inventory_text
-        from amm.config import DEFAULT_CONFIG
-    
+        
         # Initialize AMM client and working memory
         # Get API token and agent ID from environment or config
         letta_api_token = os.getenv("LETTA_API_TOKEN")
@@ -193,8 +190,8 @@ def eval(args, task_num, logger):
         
         if not letta_api_token or not letta_agent_id:
             raise ValueError(
-                        "LETTA_API_TOKEN and LETTA_AGENT_ID environment variables must be set when use_amm=True. "
-                        "Please set them before running the agent, or set use_amm=False for baseline mode."
+                                "LETTA_API_TOKEN and LETTA_AGENT_ID environment variables must be set when use_amm=True. "
+                                "Please set them before running the agent, or set use_amm=False for baseline mode."
             )
         
         amm_config = LettaConfig(
@@ -274,6 +271,8 @@ def eval(args, task_num, logger):
         system_2_focused = False
         system_1_focused_trial = 0
         swift_failure_count = 0
+        srm_no_reward_streak = 0  # Track consecutive SRM actions with reward==0
+        action_source = None  # Track action source: "swift" | "srm" | "sage" | "buffer"
         pattern = r"focus on\s+(\b\w+\b(\s+\b\w+\b)*)"
         matches = re.findall(pattern, task_description)
         to_focus = [match[0].replace("the ", " ").strip() for match in matches]
@@ -311,12 +310,12 @@ def eval(args, task_num, logger):
             recent_looks[current_place] = info["look"]
             recent_looks_flatten.append(info["look"])
             
-            # Wait one more time for delayed actions (for e.g wait for water to boil)
-            if step > 3 and recent_actions[-1] == "wait" and recent_actions[-2] != "wait":
-                if recent_looks_flatten[-1] == recent_looks_flatten[-2]:
-                    action = "wait"
+            # REMOVED: Wait bridge logic that caused loops
+            # Wait should only be chosen by SRM (with gating) or Sage, not auto-injected
+            
             # Try to use the actions from action buffer
             if action is None and len(action_buffer) > 0:
+                action_source = "buffer"  # Track buffer actions
                 # debug  
                 buffer_overall_trail = 0
                 to_remove = []
@@ -562,36 +561,38 @@ def eval(args, task_num, logger):
                         # Always call findValidActionWithSystem2 (it handles both Swift and Sage paths)
                         # This ensures found_valid_in_top is always defined
                         cycles_without_progress_val = wm.cycles_without_progress if (use_amm and wm is not None) else 0
-                        used_sys2, return_result, found_valid_in_top = findValidActionWithSystem2(
-                            predStrs, env, task_num, task_description, info['look'],
-                            recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
-                            demo_data, logger, sbert_model, step, last_time_system2_steps,
-                            useful_focus_on, focus_on_done, force_system_1, force_system_2,
-                            gpt_version, llm=llm,
-                            episodic_memories=None,  # AMM will handle memory retrieval in Phase 2
-                            use_memory_planning=use_memory_planning,
+                    used_sys2, return_result, found_valid_in_top, action_source = findValidActionWithSystem2(
+                        predStrs, env, task_num, task_description, info['look'],
+                        recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
+                        demo_data, logger, sbert_model, step, last_time_system2_steps,
+                        useful_focus_on, focus_on_done, force_system_1, force_system_2,
+                        gpt_version, llm=llm,
+                        episodic_memories=None,  # AMM will handle memory retrieval in Phase 2
+                        use_memory_planning=use_memory_planning,
                             amm_client=amm_client if use_amm else None,  # Pass AMM client only if enabled
-                            current_score=score,  # Current score for retrieval query
-                            recent_scores=recent_scores,  # Recent scores for retrieval query
-                            swift_failure_count=swift_failure_count,  # Pass swift_failure_count for T1 escalation
+                        current_score=score,  # Current score for retrieval query
+                        recent_scores=recent_scores,  # Recent scores for retrieval query
+                        swift_failure_count=swift_failure_count,  # Pass swift_failure_count for T1 escalation
                             cycles_without_progress=cycles_without_progress_val,  # Pass cycles_without_progress for T2 escalation
                             force_system_2_reason=force_system_2_reason,  # Pass reason for forcing System 2 (to bypass T1 if focus_gate)
-                            # Parameters for second Swift pass (T1-S2 retry)
-                            args=args,
-                            tokenizer=tokenizer,
-                            lm_model=lm_model,
-                            device=device,
-                            compose_instance=compose_instance,
-                            prev_action=prev_action,
-                            prev_obs=prev_obs,
-                            objects=objects,
-                            places=places
-                        )
+                        # Parameters for second Swift pass (T1-S2 retry)
+                        args={**(args or {}), "srm_no_reward_streak": srm_no_reward_streak},
+                        tokenizer=tokenizer,
+                        lm_model=lm_model,
+                        device=device,
+                        compose_instance=compose_instance,
+                        prev_action=prev_action,
+                        prev_obs=prev_obs,
+                        objects=objects,
+                        places=places
+                    )
                     
                     # Track if action was filtered by focus gating (before counter update)
                     swift_action_filtered = False
+                    # Track action source and update counters
                     if not used_sys2:
                         action = return_result
+                        action_source = action_source if action_source else "swift"  # Default to swift if not set
                         consecutive_system2 = 0
                         
                         # Check if this is a focus action that will be filtered by gating
@@ -642,11 +643,11 @@ def eval(args, task_num, logger):
                         # If ran_swift_this_step=False and not force_system_2, counter remains unchanged (shouldn't happen in normal flow)
                     
                     if not used_sys2:
-                        action = return_result
-                        consecutive_system2 = 0
-                        
+                        # Already handled above
+                        pass
                     else:
                         action = None 
+                        action_source = "sage"  # System 2 was used
                         action_buffer = return_result[0] # reset the buffer 
                         obs_buffer = return_result[1]
                         failed_messages = [] # reset the failed messages 
@@ -661,16 +662,11 @@ def eval(args, task_num, logger):
                             logger.info("[T1 Counter] Reset swift_failure_count=0 because System 2 was used.")
                         continue 
                         
-                    # action is not None but is not valid, fallback to wait
-                    if action is not None and action not in validActions:
-                        logger.info(f"action '{action}' is not in validActions; ") 
-                        logger.info("[T1 Counter] Swift returned invalid action; queued 'wait' in buffer (counter will reset once buffer action executes).")
-                        action = "wait"
-                        action_buffer.append(action)
-                        obs_buffer.append(action)
-                        continue 
-
-                    elif action is None: 
+                    # REMOVED: Invalid action wait bridge - this caused loops
+                    # If action is invalid, we should have caught it earlier or escalate to Sage
+                    # No automatic wait injection
+                    
+                    if action is None: 
                         continue 
                 else:
                     # Use Swift Agent only
@@ -757,6 +753,16 @@ def eval(args, task_num, logger):
             # Update tracking lists with TRUE values
             no_action_done = 0
             prev_action = action
+            
+            # Track SRM no-reward streak
+            if action_source == "srm":
+                if reward_true == 0:
+                    srm_no_reward_streak += 1
+                else:
+                    srm_no_reward_streak = 0  # Reset on any reward
+            elif action_source != "srm":
+                srm_no_reward_streak = 0  # Reset if not SRM action
+            
             recent_reward.append(reward_true/100)
             # Note: swift_failure_count is now tracked based on found_valid_in_top (model-level invalidity)
             # in findValidActionWithSystem2, not based on reward. Reward-based tracking is handled
@@ -765,6 +771,9 @@ def eval(args, task_num, logger):
             recent_actions.append(action) 
             recent_obs.append(obs)
             recent_locs.append(current_place)
+            
+            # Log step result
+            logger.info(f"[StepResult] source={action_source or 'unknown'} action={action} reward={reward_true} score={score_true} srm_no_reward_streak={srm_no_reward_streak}")
             
             # === AMM HOOK: POST-STEP WRITE (BEFORE any score modifications) ===
             # Write memory with TRUE reward/score values from environment (only when use_amm=True)
@@ -870,7 +879,7 @@ def eval(args, task_num, logger):
                 
                 INVALID_OBS = "No known action matches that input."
                 if (
-                    DEFAULT_CONFIG.enable_em_retrieval
+                            DEFAULT_CONFIG.enable_em_retrieval
                     and DEFAULT_CONFIG.enable_t3_retrieval
                     and len(recent_actions) >= 2
                     and len(recent_obs) >= 1
@@ -1023,7 +1032,7 @@ def parse_args():
     parser.add_argument("--debug_var", type=int, default=93)
     parser.add_argument("--use_memory_planning", action="store_true", default=True)
     parser.add_argument("--use_amm", action="store_true", default=False, help="Enable AMM (Adaptive Memory Module) retrieval and writing. Sage/System 2 is always available when slow_agent=True.")
-    parser.add_argument("--enable_srm", action="store_true", default=True, help="Enable SRM (Self-Reflection Module) for proposing guiding actions.")
+    parser.add_argument("--disable_srm", action="store_true", default=False, help="Disable SRM (Self-Reflection Module).")
     parser.add_argument("--srm_max_candidates", type=int, default=200, help="SRM: Maximum number of action candidates to consider (hard cap for efficiency).")
     parser.add_argument("--srm_recent_window", type=int, default=5, help="SRM: Number of recent actions to check for scoring.")
     args = parser.parse_args()
