@@ -19,7 +19,7 @@ import string
 import editdistance
 import time 
 import tiktoken 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Set
 
 from slow_agent import local_llm
 
@@ -133,7 +133,152 @@ rooms = ["hallway", "greenhouse", "green house", "kitchen", "bathroom", "outside
 
 
 def is_action_failed(obs):
-    return obs == "No known action matches that input." or "can't" in obs or "not" in obs or "doesn't" in obs
+    """
+    Check if observation indicates an action failure/invalidity.
+    Uses strict phrase-based matching (not token-based) to avoid false positives.
+    
+    Args:
+        obs: Observation string from environment
+    
+    Returns:
+        True if observation indicates action failure, False otherwise
+    """
+    if not obs:
+        return False
+    
+    obs_lower = obs.lower()
+    
+    # Strong failure phrases (case-insensitive)
+    failure_phrases = [
+        "no known action matches that input",
+        "i'm not sure how to use those two things together",
+        "you can't",
+        "you cannot",
+        "you don't have",
+        "you are not holding",
+        "you aren't holding",
+        "that doesn't seem possible",
+        "you can't see any such thing",
+    ]
+    
+    # Check for failure phrases
+    for phrase in failure_phrases:
+        if phrase in obs_lower:
+            return True
+    
+    # No-op phrases that are NOT failures (explicitly exclude)
+    noop_phrases = [
+        "the door is already open",
+        "the door is already closed",
+        "it's already on",
+        "it's already off",
+        "ambiguous request",  # Handled elsewhere
+    ]
+    
+    # If it's a no-op phrase, it's not a failure
+    for phrase in noop_phrases:
+        if phrase in obs_lower:
+            return False
+    
+    return False
+
+
+def is_redundant_action(
+    action: str,
+    look: str,
+    recent_obs: List[str],
+    recent_actions: List[str],
+    noop_cooldown: Optional[Set[str]] = None
+) -> bool:
+    """
+    Check if an action is redundant (no-op) based on current state.
+    
+    Rules:
+    A) Redundant "open ..." detection:
+       - If last observation contains "already open" and action equals last action => redundant
+       - If look text indicates target is already open (patterns like "(that is open)") => redundant
+    B) Door-specific rule:
+       - If action starts with "open door to " and look indicates door is already open => redundant
+       - If look indicates door is closed => not redundant
+    C) No-op cooldown:
+       - If action is in noop_cooldown set => redundant (unless no alternatives)
+    
+    Args:
+        action: Action string to check
+        look: Current look/observation string
+        recent_obs: List of recent observations (most recent last)
+        recent_actions: List of recent actions (most recent last)
+        noop_cooldown: Optional set of actions that caused no-ops recently
+    
+    Returns:
+        True if action is redundant, False otherwise
+    """
+    action_lower = action.strip().lower()
+    look_lower = look.lower() if look else ""
+    
+    # C) Check no-op cooldown
+    if noop_cooldown and action in noop_cooldown:
+        return True
+    
+    # A) Check if last observation indicates redundancy
+    if recent_obs and len(recent_obs) > 0:
+        last_obs_lower = recent_obs[-1].lower()
+        
+        # Check for "already open" in last observation
+        if "already open" in last_obs_lower:
+            # If action equals last action, it's redundant
+            if recent_actions and len(recent_actions) > 0:
+                if action.lower() == recent_actions[-1].lower():
+                    return True
+        
+        # Check for other no-op patterns
+        noop_patterns = ["already closed", "already on", "already off", "already turned on", "already turned off"]
+        if any(pattern in last_obs_lower for pattern in noop_patterns):
+            if recent_actions and len(recent_actions) > 0:
+                if action.lower() == recent_actions[-1].lower():
+                    return True
+    
+    # B) Check look text for "open ..." actions
+    if action_lower.startswith("open "):
+        # Check if look indicates target is already open
+        # Patterns: "door to X (that is open)", "freezer (that is open)", "X (that is open)"
+        if "(that is open)" in look_lower:
+            # Extract target from action
+            target = action_lower[len("open "):].strip()
+            if target:
+                # Check if look mentions this target as open
+                # Simple heuristic: if target appears near "open" in look
+                target_words = set(target.split())
+                look_words = look_lower.split()
+                # Check if target words appear and "open" appears nearby
+                if target_words:
+                    for i, word in enumerate(look_words):
+                        if word in target_words:
+                            # Check nearby words for "open"
+                            window_start = max(0, i - 5)
+                            window_end = min(len(look_words), i + 5)
+                            window_text = " ".join(look_words[window_start:window_end])
+                            if "open" in window_text and "(that is open)" in look_lower:
+                                return True
+        
+        # B) Door-specific check
+        if action_lower.startswith("open door to "):
+            dest = action_lower[len("open door to "):].strip()
+            if dest:
+                # Check if look indicates this door is open
+                # Pattern: "door to <dest> (that is open)"
+                door_pattern_open = f"door to {dest} (that is open)"
+                door_pattern_open_alt = f"door to the {dest} (that is open)"
+                if door_pattern_open in look_lower or door_pattern_open_alt in look_lower:
+                    return True
+                
+                # Check if look indicates door is closed (not redundant)
+                door_pattern_closed = f"door to {dest} (that is closed)"
+                door_pattern_closed_alt = f"door to the {dest} (that is closed)"
+                if door_pattern_closed in look_lower or door_pattern_closed_alt in look_lower:
+                    return False  # Door is closed, action is not redundant
+    
+    return False
 
 def find_non_alpha_index(s):
     for i, c in enumerate(s):
@@ -234,8 +379,8 @@ def load_variation(env, args, task_num, logger):
     elif (args["set"] == "test"):               
         variations = list(env.getVariationsTest())
         # Test configuration: use only 3 variations
-        # variations = variations[:1]
-        variations = variations[: min(10, len(variations))]
+        variations = variations[:1]
+        # variations = variations[: min(10, len(variations))]
     elif (args["set"] == "dev"):
         variations = list(env.getVariationsDev()) 
         variations = variations[:3]
@@ -663,19 +808,30 @@ def rerun_swift_with_same_context(
     if recent_actions and predStrs and recent_actions[-1].startswith("wait") and predStrs[0].startswith("wait"):
         predStrs = predStrs[1:]
     
-    # BASELINE: Try top-1 prediction only (matching baseline findValidActionWithSystem2)
-    for pred in predStrs[:1]:
-        pred = try_to_replace(pred, validActions, look, inventory)
-        action = pred.strip()
-        if pred.strip() in validActions:
+    # Swift validation: top-K check (K=5 by default, same as findValidActionWithSystem2)
+    K = min(len(predStrs), args.get("beams", 5)) if args else min(len(predStrs), 5)
+    found_valid_in_top = False
+    action = None
+    valid_at = None
+    
+    # Check top-K predictions after repair
+    for idx, pred in enumerate(predStrs[:K]):
+        pred_repaired = try_to_replace(pred, validActions, look, inventory)
+        pred_repaired_stripped = pred_repaired.strip()
+        
+        # Skip focus actions if focus_on_done
+        if pred_repaired_stripped.startswith("focus on") and focus_on_done:
+            continue
+        
+        # Pick first valid action
+        if pred_repaired_stripped in validActions:
+            action = pred_repaired_stripped
             found_valid_in_top = True
+            valid_at = idx
             break
     
-    # BASELINE DEBUG LOGS (downgraded to DEBUG to reduce noise)
-    logger.debug(f"[Swift Baseline] Second pass - predictions top-1: {predStrs[0].strip() if predStrs else 'N/A'}")
-    logger.debug(f"[Swift Baseline] Second pass - after try_to_replace: {action}")
-    logger.debug(f"[Swift Baseline] Second pass - membership check: {action in validActions if action else False}")
-    logger.debug(f"[Swift Baseline] Second pass - found_valid_in_top={found_valid_in_top}, final action={action}")
+    # Log Swift validation results
+    logger.info(f"[Swift] T1-retry topK={K} valid_at={valid_at} chosen={action if action else 'None'}")
     
     # BASELINE CONTRACT: found_valid_in_top must reflect whether Swift produced an action actually in validActions.
     # We do NOT force it True for invalid actions, even though the outer loop may fallback to "wait".
@@ -742,25 +898,33 @@ def findValidActionWithSystem2(
     validActions = getFilteredValidActions(env, look, task_id=task_id, task_desc=task_description)
     enable_system2 = True
 
-    # BASELINE: Fast-agent heuristics (top-1 check only)
+    # Swift validation: top-K check (K=5 by default)
+    K = min(len(predictions), args.get("beams", 5)) if args else min(len(predictions), 5)
     found_valid_in_top = False
     action = None
+    valid_at = None
+    
     if recent_actions and predictions and recent_actions[-1].startswith("wait") and predictions[0].startswith("wait"):
         predictions = predictions[1:]
-    for pred in predictions[:1]:  # BASELINE: Check top-1 only
-        pred = try_to_replace(pred, validActions, look, inventory)
-        action = pred.strip()
-        if pred.strip().startswith("focus on") and focus_on_done:
-            break
-        if pred.strip() in validActions:
+    
+    # Check top-K predictions after repair
+    for idx, pred in enumerate(predictions[:K]):
+        pred_repaired = try_to_replace(pred, validActions, look, inventory)
+        pred_repaired_stripped = pred_repaired.strip()
+        
+        # Skip focus actions if focus_on_done
+        if pred_repaired_stripped.startswith("focus on") and focus_on_done:
+            continue
+        
+        # Pick first valid action
+        if pred_repaired_stripped in validActions:
+            action = pred_repaired_stripped
             found_valid_in_top = True
+            valid_at = idx
             break
     
-    # BASELINE DEBUG LOGS (downgraded to DEBUG to reduce noise)
-    logger.debug(f"[Swift Baseline] predictions top-1: {predictions[0].strip() if predictions else 'N/A'}")
-    logger.debug(f"[Swift Baseline] after try_to_replace: {action}")
-    logger.debug(f"[Swift Baseline] membership check: {action in validActions if action else False}")
-    logger.debug(f"[Swift Baseline] found_valid_in_top={found_valid_in_top}, final action={action}")
+    # Log Swift validation results
+    logger.info(f"[Swift] topK={K} valid_at={valid_at} chosen={action if action else 'None'}")
     
     # BASELINE CONTRACT: found_valid_in_top must reflect whether Swift produced an action actually in validActions.
     # We do NOT force it True for invalid actions, even though the outer loop may fallback to "wait".

@@ -13,7 +13,7 @@ from scienceworld import ScienceWorldEnv
 from data_utils.data_utils import add_current_place, add_current_objects, sanitizeStr, formalize_action
 from data_utils.data_utils import compose_instance_v1, compose_instance_v1_1, compose_instance_v2, compose_instance_v3, compose_instance_v4
 from eval_utils import load_model, findValidActionNew, load_variation, get_model_output, findValidActionWithSystem2, getFilteredValidActions, sbert_search, clean_look, is_action_failed 
-from eval_utils import try_to_replace, rooms, clean_history, get_current_room, clean_obj_name, focus_on_count, rank_candidates_by_common_words, gpt_select_valid
+from eval_utils import try_to_replace, rooms, clean_history, get_current_room, clean_obj_name, focus_on_count, rank_candidates_by_common_words, gpt_select_valid, is_redundant_action
 
 # AMM imports (used for EM writing and T3 retrieval, not for proactive Swift retrieval)
 from amm.config import DEFAULT_CONFIG
@@ -273,6 +273,7 @@ def eval(args, task_num, logger):
         swift_failure_count = 0
         srm_no_reward_streak = 0  # Track consecutive SRM actions with reward==0
         action_source = None  # Track action source: "swift" | "srm" | "sage" | "buffer"
+        noop_cooldown = set()  # Track actions that caused no-ops (cooldown for redundant actions)
         pattern = r"focus on\s+(\b\w+\b(\s+\b\w+\b)*)"
         matches = re.findall(pattern, task_description)
         to_focus = [match[0].replace("the ", " ").strip() for match in matches]
@@ -393,6 +394,9 @@ def eval(args, task_num, logger):
                         if not act_cand:
                             continue 
                         obs_buf, reward_buf, done_buf, info_buf = env.step(act_cand)
+                        # Log env step ground truth for buffer trial
+                        current_place_buf = get_current_room(info_buf['look'])
+                        logger.info(f"[ENV_STEP] source=buffer executed_from_buffer=True action='{act_cand}' reward={reward_buf} score={info_buf['score']} done={done_buf} room={current_place_buf} obs={obs_buf[:160]}")
                         logger.info(f"Trying to execute [{act_cand}] in the buffer.")  
                         if is_action_failed(obs_buf):
                             logger.info(f"\t\t Failed: [{act_cand}] --> {obs_buf}")
@@ -416,11 +420,15 @@ def eval(args, task_num, logger):
                         action_buffer.pop(action_ind)
                         obs_buffer.pop(action_ind)
                         action = final_action
+                        action_source = "buffer"
                         picked_from_buffer = True
                         buffer_overall_trail = 0
                         # Handle ambiguous requests for buffer-executed actions
                         if obs.startswith("Ambiguous request"):
                             obs, reward_env, done, info = env.step("0")
+                            # Log ambiguous resolution step for buffer action
+                            current_place_after_resolve = get_current_room(info['look'])
+                            logger.info(f"[ENV_STEP] source=buffer executed_from_buffer=True action='0' reward={reward_env} score={info['score']} done={done} room={current_place_after_resolve} obs={obs[:160]}")
                         break 
                     else:
                         failed_action_trial[action_candidate] += 1
@@ -725,14 +733,69 @@ def eval(args, task_num, logger):
                         pass
                     continue 
             
+            # Global redundant-action filter: check if action is redundant before execution
+            if action is not None and not executed:
+                if is_redundant_action(action, info['look'], recent_obs, recent_actions, noop_cooldown):
+                    logger.info(f"[RedundantAction] Skipping redundant action: '{action}'")
+                    # Try to find alternative action from Swift predictions if available
+                    if ran_swift_this_step and predStrs:
+                        validActions = getFilteredValidActions(env, info['look'], task_id=task_num, task_desc=task_description)
+                        alternative_action = None
+                        for pred in predStrs[1:]:  # Try predictions 1, 2, 3...
+                            pred_repaired = try_to_replace(pred, validActions, info['look'], info['inv'])
+                            if pred_repaired.strip() in validActions:
+                                if not is_redundant_action(pred_repaired.strip(), info['look'], recent_obs, recent_actions, noop_cooldown):
+                                    alternative_action = pred_repaired.strip()
+                                    logger.info(f"[RedundantAction] Selected alternative action='{alternative_action}'")
+                                    action = alternative_action
+                                    break
+                        
+                        if alternative_action is None:
+                            # All Swift candidates are redundant, try SRM if enabled
+                            from eval_utils import _ensure_srm_imported
+                            if enable_srm and not args.get("disable_srm", False):
+                                try:
+                                    srm_propose_action_func = _ensure_srm_imported(args, logger)
+                                    if srm_propose_action_func is not None:
+                                        valid_actions_list = list(validActions)
+                                        srm_action = srm_propose_action_func(
+                                            valid_actions=valid_actions_list,
+                                            task_description=task_description,
+                                            look=info['look'],
+                                            inventory=str(info['inv']) if info.get('inv') else "",
+                                            recent_actions=recent_actions,
+                                            recent_obs=recent_obs,
+                                            max_candidates=args.get("srm_max_candidates", 200),
+                                            recent_window=args.get("srm_recent_window", 5),
+                                        )
+                                        if srm_action and srm_action in validActions:
+                                            if not is_redundant_action(srm_action, info['look'], recent_obs, recent_actions, noop_cooldown):
+                                                logger.info(f"[RedundantAction] Using SRM alternative: '{srm_action}'")
+                                                action = srm_action
+                                                action_source = "srm"
+                                            else:
+                                                logger.info(f"[RedundantAction] SRM action also redundant: '{srm_action}'")
+                                                action = None
+                                except Exception:
+                                    pass  # SRM not available or failed
+                            
+                            if action is None or is_redundant_action(action, info['look'], recent_obs, recent_actions, noop_cooldown):
+                                logger.info(f"[RedundantAction] All candidates redundant, skipping step")
+                                continue
             
             # If the action was not already executed in the previous loop, execute it
             if not executed:
                 obs, reward_env, done, info = env.step(action)
-
+                # Log env step ground truth
+                current_place_after_step = get_current_room(info['look'])
+                logger.info(f"[ENV_STEP] source={action_source or 'unknown'} executed_from_buffer=False action='{action}' reward={reward_env} score={info['score']} done={done} room={current_place_after_step} obs={obs[:160]}")
+            
             # Handle ambiguous requests (resolve by choosing "0")
             if obs.startswith("Ambiguous request"):
                 obs, reward_env, done, info = env.step("0")
+                # Log ambiguous resolution step
+                current_place_after_resolve = get_current_room(info['look'])
+                logger.info(f"[ENV_STEP] source={action_source or 'unknown'} executed_from_buffer=False action='0' reward={reward_env} score={info['score']} done={done} room={current_place_after_resolve} obs={obs[:160]}")
             
             # Capture TRUE values from environment immediately after step
             # Reward is 0 if score doesn't increase (no negative rewards)

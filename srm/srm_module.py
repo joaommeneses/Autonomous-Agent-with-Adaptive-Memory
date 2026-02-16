@@ -21,6 +21,7 @@ SRM_V2_VERBS = tuple(sorted([
     "inspect",
     "search",
     "open",
+    "connect",
     "use",
     "pour",
     "mix",
@@ -41,6 +42,8 @@ VERB_BASE_WEIGHTS = {
     "inspect": 5,
     "activate": 4,
     "deactivate": 4,
+    "turn on": 4,  # Match activate
+    "turn off": 4,  # Match deactivate
     "connect": 4,
     "disconnect": 4,
     "use": 3,
@@ -53,6 +56,14 @@ VERB_BASE_WEIGHTS = {
     "wait": 0,
 }
 
+# Self-check: ensure verb sets are consistent
+_missing_in_verbs = set(VERB_BASE_WEIGHTS.keys()) - set(SRM_V2_VERBS)
+_missing_in_weights = set(SRM_V2_VERBS) - set(VERB_BASE_WEIGHTS.keys())
+if _missing_in_verbs:
+    raise ValueError(f"VERB_BASE_WEIGHTS contains verbs not in SRM_V2_VERBS: {_missing_in_verbs}")
+if _missing_in_weights:
+    raise ValueError(f"SRM_V2_VERBS contains verbs not in VERB_BASE_WEIGHTS: {_missing_in_weights}")
+
 # Progress keywords for wait gating
 PROGRESS_KEYWORDS = {
     "boil", "boiling", "heat", "heating", "warm", "warming",
@@ -62,7 +73,7 @@ PROGRESS_KEYWORDS = {
 }
 
 # Minimal stopwords for token extraction
-STOPWORDS = {"the", "and", "with", "for", "from", "that", "this", "are", "was", "were", "been", "have", "has", "had"}
+STOPWORDS = {"the", "and", "with", "for", "from", "that", "this", "are", "was", "were", "been", "have", "has", "had", "substance"}
 
 # Disfavored target tokens (apply strong penalty if these appear in action arguments)
 DISFAVORED_TOKENS = {"air", "outside", "agent"}
@@ -70,8 +81,48 @@ DISFAVORED_TOKENS = {"air", "outside", "agent"}
 # Failure keywords for cooldown (if last_obs contains these, apply strong penalty to that action)
 FAILURE_KEYWORDS = {"doesn't", "not sure how"}
 
+# No-op keywords for cooldown (if last_obs contains these, treat action as redundant/no-op)
+NOOP_KEYWORDS = {
+    "already open", "already closed", "already on", "already off",
+    "already turned on", "already turned off"
+}
+
 # Punctuation removal translation table (hoisted for performance)
 PUNCTUATION_TRANSLATOR = str.maketrans('', '', string.punctuation)
+
+# Door action constants and helpers
+DOOR_ACTION_PREFIX = "open door to "
+
+
+def is_open_door_action(action: str) -> bool:
+    """Check if action is an 'open door to <room>' navigation action."""
+    return action.strip().lower().startswith(DOOR_ACTION_PREFIX)
+
+
+def door_destination(action: str) -> str:
+    """
+    Extract destination room token from door action.
+    
+    Args:
+        action: Action string (e.g., "open door to kitchen")
+    
+    Returns:
+        Destination room token (lowercased, trimmed), or empty string if malformed
+    """
+    if not is_open_door_action(action):
+        return ""
+    
+    try:
+        # Extract text after prefix
+        dest = action.strip().lower()[len(DOOR_ACTION_PREFIX):].strip()
+        # Take first token (room name)
+        dest_tokens = dest.split()
+        if dest_tokens:
+            return dest_tokens[0]
+        return ""
+    except Exception:
+        # Robust: return empty string on any error
+        return ""
 
 
 def extract_tokens(text: str) -> Set[str]:
@@ -99,22 +150,90 @@ def extract_tokens(text: str) -> Set[str]:
     return tokens
 
 
+def extract_ordered_tokens(text: str) -> List[str]:
+    """
+    Extract tokens from text preserving order (lowercase, punctuation removed, stopwords removed, len>=3).
+    
+    Args:
+        text: Input text string
+    
+    Returns:
+        List of tokens in order
+    """
+    if not text:
+        return []
+    
+    text_lower = text.lower()
+    text_clean = text_lower.translate(PUNCTUATION_TRANSLATOR)
+    
+    tokens = []
+    for token in text_clean.split():
+        token = token.strip()
+        if len(token) >= 3 and token not in STOPWORDS:
+            tokens.append(token)
+    
+    return tokens
+
+
+def split_primary_object_phrase(verb: str, arg_text: str) -> str:
+    """
+    Extract the primary object phrase from arg_text based on verb semantics.
+    
+    For verbs with destinations/secondary objects (move/put/pour/dunk/mix/use/connect/disconnect),
+    splits on delimiters to get the primary object (left part).
+    Otherwise returns arg_text as-is.
+    
+    Args:
+        verb: Parsed verb string
+        arg_text: Argument text after verb
+    
+    Returns:
+        Primary object phrase (lowercased, trimmed)
+    """
+    if not arg_text:
+        return ""
+    
+    arg_lower = arg_text.lower().strip()
+    
+    # Verbs that typically have a destination/secondary object
+    verbs_with_destination = {"move", "put", "pour", "dunk", "mix", "use", "connect", "disconnect"}
+    
+    if verb in verbs_with_destination:
+        # Split on first occurrence of delimiter tokens
+        delimiters = [" to ", " into ", " in ", " on ", " onto ", " from ", " with "]
+        for delimiter in delimiters:
+            if delimiter in arg_lower:
+                primary_phrase = arg_lower.split(delimiter, 1)[0].strip()
+                if primary_phrase:
+                    return primary_phrase
+        
+        # If no delimiter found, return arg_text as-is
+        return arg_lower
+    else:
+        # For other verbs, primary phrase is the whole arg_text
+        return arg_lower
+
+
 def parse_action(action: str) -> Tuple[Optional[str], str, Set[str], Optional[str]]:
     """
     Parse action into verb, arg_text, arg_tokens, and main_object.
     Uses longest-prefix matching from SRM v2 verb set.
     
     Args:
-        action: Action string (e.g., "examine apple", "pick up red paint")
+        action: Action string (e.g., "examine apple", "pick up red paint", "wait1")
     
     Returns:
         Tuple of (verb, arg_text, arg_tokens, main_object)
         - verb: Matched verb from SRM v2 verb set, or None
         - arg_text: String after verb
-        - arg_tokens: Tokens extracted from arg_text
-        - main_object: First token in arg_tokens, or None
+        - arg_tokens: Primary object tokens (Set[str]) - NOT full arg tokens
+        - main_object: Primary object phrase (deterministic string), or None
     """
     action_normalized = action.strip().lower()
+    
+    # Special case: "wait1" should be treated as "wait"
+    if action_normalized == "wait1":
+        return "wait", "", set(), None
     
     # Find longest matching verb prefix
     matched_verb = None
@@ -134,11 +253,21 @@ def parse_action(action: str) -> Tuple[Optional[str], str, Set[str], Optional[st
     # Extract arg_text (everything after verb)
     arg_text = action[len(matched_verb):].strip()
     
-    # Extract arg_tokens
-    arg_tokens = extract_tokens(arg_text)
+    # Extract primary object phrase
+    primary_phrase = split_primary_object_phrase(matched_verb, arg_text)
     
-    # Get main_object (first token in arg_tokens)
-    main_object = next(iter(sorted(arg_tokens))) if arg_tokens else None
+    # Extract ordered tokens from primary phrase
+    primary_tokens_ordered = extract_ordered_tokens(primary_phrase)
+    primary_tokens_set = set(primary_tokens_ordered)
+    
+    # arg_tokens now represents primary tokens (not full arg tokens)
+    arg_tokens = primary_tokens_set
+    
+    # main_object: join first 3 primary tokens for deterministic string
+    if primary_tokens_ordered:
+        main_object = " ".join(primary_tokens_ordered[:3])
+    else:
+        main_object = None
     
     return matched_verb, arg_text, arg_tokens, main_object
 
@@ -147,7 +276,8 @@ def filter_candidates(
     valid_actions: List[str],
     task_tokens: Set[str],
     context_tokens: Set[str],
-    max_candidates: int = 200
+    max_candidates: int = 200,
+    task_description: str = ""
 ) -> List[str]:
     """
     Filter candidates by verb + overlap gate.
@@ -164,6 +294,7 @@ def filter_candidates(
         task_tokens: Tokens from task description
         context_tokens: Tokens from look + inventory
         max_candidates: Maximum number of candidates to return (for compatibility, but full scan preferred)
+        task_description: Task description string (for "use" intent checking)
     
     Returns:
         List of filtered candidate actions (no early capping - scans all valid_actions)
@@ -181,6 +312,18 @@ def filter_candidates(
         if verb == "wait":
             candidates.append(action)
             continue
+        
+        # Strengthen "use" gate: require task token overlap OR task intent keywords
+        if verb == "use":
+            task_overlap = bool(arg_tokens & task_tokens)
+            # Check for "use" intent keywords in task description
+            task_lower = task_description.lower() if task_description else ""
+            use_intent_keywords = ["use", "measure", "check", "temperature", "thermometer", "test"]
+            has_use_intent = any(keyword in task_lower for keyword in use_intent_keywords)
+            
+            # Only include "use" actions if task overlap OR use intent present
+            if not (task_overlap or has_use_intent):
+                continue  # Skip "use" actions without clear task relevance
         
         # Check overlap with task or context
         task_overlap = bool(arg_tokens & task_tokens)
@@ -232,6 +375,14 @@ def score_action_v2(
     base_weight = VERB_BASE_WEIGHTS.get(verb, 0)
     score = base_weight
     
+    # Door action penalty: de-prioritize "open door to ..." navigation
+    if is_open_door_action(action):
+        score -= 12
+        # Partial offset if destination is explicitly mentioned in task
+        dest = door_destination(action)
+        if dest and dest in task_tokens:
+            score += 6  # Still allow task-relevant room moves if truly needed
+    
     # Task relevance
     task_overlap_count = len(arg_tokens & task_tokens)
     task_relevance_bonus = 4 * min(task_overlap_count, 3)  # Cap to +12
@@ -254,13 +405,16 @@ def score_action_v2(
     if arg_tokens & DISFAVORED_TOKENS:
         score -= 10
     
-    # B.5) Strongly gate/penalize "use" actions
+    # B.5) Conditionally gate/penalize "use" actions
     # "use" should lose against open/search/examine/inspect/activate/deactivate/move unless clearly relevant
     if verb == "use":
-        # Only allow "use" to compete if it has strong relevance signals
-        # If task/context relevance is weak, apply penalty
-        # if task_relevance_bonus == 0 and context_relevance_bonus == 0:
-        score -= 10  # Penalty for "use" without clear relevance
+        # Strong penalty if no task overlap
+        if task_overlap_count == 0:
+            score -= 20  # Very strong penalty for "use" without task relevance
+        elif task_relevance_bonus == 0 and context_relevance_bonus == 0:
+            score -= 10  # Strong penalty for "use" without clear relevance
+        else:
+            score -= 2  # Small bias against "use" unless clearly helpful
         # Even with relevance, "use" base weight (3) is lower than open/search (6), examine/inspect (5)
         # So it will naturally lose unless relevance is very strong
     
@@ -297,6 +451,17 @@ def score_action_v2(
             if past_verb == verb and past_main == main_object:
                 score -= 2
                 break
+        
+        # Anti-loop specifically for door navigation
+        if is_open_door_action(action):
+            # Additional -10 if exact same door action in recent window
+            if action in recent_window_actions:
+                score -= 10
+            # Additional -4 if any open-door action (any destination) in recent window
+            for past_action in recent_window_actions:
+                if is_open_door_action(past_action):
+                    score -= 4
+                    break
     
     # Wait gating
     if verb == "wait":
@@ -370,17 +535,20 @@ def propose_action(
     inv_tokens = extract_tokens(inventory)
     context_tokens = look_tokens | inv_tokens
     
-    # B.6) Build impossible_actions set from recent_obs failure keywords
+    # B.6) Build impossible_actions set from recent_obs failure keywords and no-op keywords
     impossible_actions = set()
     if recent_obs and len(recent_obs) > 0 and len(recent_actions) > 0:
         last_obs_lower = recent_obs[-1].lower()
+        # Check for failure keywords
         has_failure_keyword = any(keyword in last_obs_lower for keyword in FAILURE_KEYWORDS)
-        if has_failure_keyword and recent_actions:
-            # Add the last action that caused the failure to impossible set
+        # Check for no-op keywords (already open/closed/on/off)
+        has_noop_keyword = any(keyword in last_obs_lower for keyword in NOOP_KEYWORDS)
+        if (has_failure_keyword or has_noop_keyword) and recent_actions:
+            # Add the last action that caused the failure/no-op to impossible set
             impossible_actions.add(recent_actions[-1])
     
     # Filter candidates (scans ALL valid_actions, no early capping)
-    candidates = filter_candidates(valid_actions, task_tokens, context_tokens, max_candidates)
+    candidates = filter_candidates(valid_actions, task_tokens, context_tokens, max_candidates, task_description)
     
     if not candidates:
         return None
@@ -392,6 +560,28 @@ def propose_action(
     if non_wait_candidates:
         # Remove wait from candidates if there are alternatives
         candidates = non_wait_candidates
+    
+    # Door action policy: "open door to ..." is LAST RESORT
+    # Partition candidates into door and non-door actions
+    door_candidates = [c for c in candidates if is_open_door_action(c)]
+    other_candidates = [c for c in candidates if not is_open_door_action(c)]
+    
+    if other_candidates:
+        # Never choose door navigation if any other candidate exists
+        candidates = other_candidates
+    elif door_candidates:
+        # Only door candidates exist - narrow by task tokens if possible
+        task_relevant_doors = []
+        for door_action in door_candidates:
+            dest = door_destination(door_action)
+            if dest and dest in task_tokens:
+                task_relevant_doors.append(door_action)
+        
+        # Use task-relevant doors if any exist, otherwise keep all door candidates as last resort
+        if task_relevant_doors:
+            candidates = task_relevant_doors
+        else:
+            candidates = door_candidates
     
     # B.3) Score ALL candidates (no early capping - full scan)
     # This ensures we don't miss good actions due to iteration order
@@ -430,5 +620,10 @@ def propose_action(
     # B.8) Minimal debug info (verb + main_object for logging)
     # This is returned implicitly via best_action, but caller can parse if needed
     # For now, we just return the action (caller already logs it)
+    
+    # NOTE: If best_action is an open-door action, it was chosen only because:
+    # - No other candidates existed, OR
+    # - Task explicitly mentioned the destination room
+    # (No logger dependency - caller can log this if needed)
     
     return best_action
