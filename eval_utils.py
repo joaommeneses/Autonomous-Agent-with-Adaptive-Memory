@@ -379,8 +379,8 @@ def load_variation(env, args, task_num, logger):
     elif (args["set"] == "test"):               
         variations = list(env.getVariationsTest())
         # Test configuration: use only 3 variations
-        variations = variations[:1]
-        # variations = variations[: min(10, len(variations))]
+        #variations = variations[:1]
+        variations = variations[: min(10, len(variations))]
     elif (args["set"] == "dev"):
         variations = list(env.getVariationsDev()) 
         variations = variations[:3]
@@ -631,6 +631,14 @@ def try_to_replace(action, validActions, look=None, inventory=None):
             return action.replace("go to", "teleport to")
         elif action.replace("go to", "open door to") in validActions:
             return action.replace("go to", "open door to") 
+    if action.startswith("examine "):
+        look_at_alias = action.replace("examine ", "look at ", 1)
+        if look_at_alias in validActions:
+            return look_at_alias
+    if action.startswith("look at "):
+        examine_alias = action.replace("look at ", "examine ", 1)
+        if examine_alias in validActions:
+            return examine_alias
     if action.startswith("pick up"):
         action = find_object(action, look)
         if action in validActions:
@@ -808,13 +816,13 @@ def rerun_swift_with_same_context(
     if recent_actions and predStrs and recent_actions[-1].startswith("wait") and predStrs[0].startswith("wait"):
         predStrs = predStrs[1:]
     
-    # Swift validation: top-K check (K=5 by default, same as findValidActionWithSystem2)
-    K = min(len(predStrs), args.get("beams", 5)) if args else min(len(predStrs), 5)
+    # Swift validation: strict Top-1 only (paper-aligned baseline)
+    K = min(len(predStrs), 1)
     found_valid_in_top = False
     action = None
     valid_at = None
     
-    # Check top-K predictions after repair
+    # Check top-1 prediction after repair
     for idx, pred in enumerate(predStrs[:K]):
         pred_repaired = try_to_replace(pred, validActions, look, inventory)
         pred_repaired_stripped = pred_repaired.strip()
@@ -831,7 +839,7 @@ def rerun_swift_with_same_context(
             break
     
     # Log Swift validation results
-    logger.info(f"[Swift] T1-retry topK={K} valid_at={valid_at} chosen={action if action else 'None'}")
+    logger.info(f"[Swift] T1-retry top1 valid_at={valid_at} chosen={action if action else 'None'}")
     
     # BASELINE CONTRACT: found_valid_in_top must reflect whether Swift produced an action actually in validActions.
     # We do NOT force it True for invalid actions, even though the outer loop may fallback to "wait".
@@ -892,14 +900,15 @@ def findValidActionWithSystem2(
     # Parameters for second Swift pass (T1-S2 retry)
     args=None, tokenizer=None, lm_model=None, device=None,
     compose_instance=None, prev_action=None, prev_obs=None,
-    objects=None, places=None
+    objects=None, places=None,
+    srm_gate=None
 ):
     inventory = env.inventory()
     validActions = getFilteredValidActions(env, look, task_id=task_id, task_desc=task_description)
     enable_system2 = True
 
-    # Swift validation: top-K check (K=5 by default)
-    K = min(len(predictions), args.get("beams", 5)) if args else min(len(predictions), 5)
+    # Swift validation: strict Top-1 only (paper-aligned baseline)
+    K = min(len(predictions), 1)
     found_valid_in_top = False
     action = None
     valid_at = None
@@ -907,7 +916,7 @@ def findValidActionWithSystem2(
     if recent_actions and predictions and recent_actions[-1].startswith("wait") and predictions[0].startswith("wait"):
         predictions = predictions[1:]
     
-    # Check top-K predictions after repair
+    # Check top-1 prediction after repair
     for idx, pred in enumerate(predictions[:K]):
         pred_repaired = try_to_replace(pred, validActions, look, inventory)
         pred_repaired_stripped = pred_repaired.strip()
@@ -924,7 +933,7 @@ def findValidActionWithSystem2(
             break
     
     # Log Swift validation results
-    logger.info(f"[Swift] topK={K} valid_at={valid_at} chosen={action if action else 'None'}")
+    logger.info(f"[Swift] top1 valid_at={valid_at} chosen={action if action else 'None'}")
     
     # BASELINE CONTRACT: found_valid_in_top must reflect whether Swift produced an action actually in validActions.
     # We do NOT force it True for invalid actions, even though the outer loop may fallback to "wait".
@@ -1234,82 +1243,8 @@ def findValidActionWithSystem2(
         logger.info(f"[Baseline] enable_system2={enable_system2}, force_system_2={force_system_2}")
         return False, action, found_valid_in_top, "swift"
 
-    # === SRM TRIGGER: Self-Reflection Module (before System 2 escalation) ===
-    # SRM proposes useful "probe" actions when Swift fails to produce a valid action
-    # SRM runs BEFORE Sage/System 2, and only when AMM is disabled
-    # SRM triggers whenever Swift fails (found_valid_in_top == False)
-    
-    # Check if SRM should be bypassed due to escalation policy
-    srm_no_reward_streak = args.get("srm_no_reward_streak", 0) if args else 0
-    bypass_srm_for_sage = (srm_no_reward_streak >= 2)
-    
-    # Ensure SRM is imported if enabled
-    try:
-        srm_propose_action_func = _ensure_srm_imported(args, logger)
-    except ImportError:
-        # SRM import failed and SRM is enabled - abort
-        raise
-    
-    if srm_propose_action_func is not None:
-        # Read SRM flags from args
-        enable_srm = not bool(args.get("disable_srm", False)) if args else True
-        srm_max_candidates = int(args.get("srm_max_candidates", 200)) if args else 200
-        srm_recent_window = int(args.get("srm_recent_window", 5)) if args else 5
-        
-        # SRM only runs when AMM is OFF (SRM-only phase) and SRM is enabled
-        srm_allowed = enable_srm and (amm_client is None)
-        
-        # SRM triggers when Swift failed to produce a valid action
-        # SRM runs BEFORE Sage, so we don't check force_system_2 here
-        if srm_allowed and not found_valid_in_top and predictions:
-            if bypass_srm_for_sage:
-                logger.info(f"[Policy] escalate_to=Sage reason=srm_streak (srm_no_reward_streak={srm_no_reward_streak})")
-                # Skip SRM, go directly to Sage
-            else:
-                logger.info(f"[SRM] trigger: swift_topK_failed, srm_no_reward_streak={srm_no_reward_streak}")
-                
-                # Log validActions (truncated for readability)
-                valid_actions_list = list(validActions)
-                valid_actions_preview = sorted(valid_actions_list)[:20]
-                logger.info(f"[SRM Trigger] validActions (n={len(valid_actions_list)}): {valid_actions_preview}{'...' if len(valid_actions_list) > 20 else ''}")
-                
-                # Call SRM v2
-                srm_action = srm_propose_action_func(
-                    valid_actions=valid_actions_list,
-                    task_description=task_description,
-                    look=look,
-                    inventory=str(inventory) if inventory else "",
-                    recent_actions=recent_actions,
-                    recent_obs=recent_obs,
-                    max_candidates=srm_max_candidates,
-                    recent_window=srm_recent_window,
-                )
-                
-                if srm_action is not None and srm_action in validActions:
-                    logger.info(f"[SRM] proposed={srm_action}")
-                    # Return action_source="srm" via a special return format
-                    # We'll modify return signature to include action_source
-                    return False, srm_action, False, "srm"  # found_valid_in_top=False, action, found_valid_in_top, action_source
-                else:
-                    logger.info(f"[SRM] proposed=None")
-                    if srm_action is not None:
-                        logger.info(f"[SRM] Proposed action '{srm_action}' not in validActions")
-        elif not srm_allowed and not found_valid_in_top:
-            logger.info(f"[Policy] escalate_to=Sage reason=srm_disabled_or_amm_enabled")
-    elif not found_valid_in_top:
-        logger.info(f"[Policy] escalate_to=Sage reason=srm_none")
-    
-    # Fallback: if SRM didn't run or didn't propose a valid action, try baseline retry
-    if ((not found_valid_in_top and (step - last_sys2) <= 2) or force_system_1) and not force_system_2:
-        cand_preds = [try_to_replace(p, validActions, look, inventory)
-                      for p in predictions if not p.startswith("focus on")]
-        cand_preds = cand_preds[:3]
-        trial_action = next((p for p in cand_preds if p in validActions), None)
-        trial_action = trial_action or (cand_preds[0] if cand_preds else None)
-        # trial_action might be valid even if found_valid_in_top was False, so check if trial_action is in validActions
-        trial_found_valid = trial_action is not None and trial_action in validActions
-        return False, trial_action, trial_found_valid, "swift"
-    # ================================================================
+    # Milestone-1 SRM mode is gate-only; no SRM action proposing here.
+    # On Top-1 invalid Swift output, keep baseline switch behavior and proceed to System 2 flow below.
 
     # System 2
     assert enable_system2 or force_system_2
@@ -1543,6 +1478,13 @@ def findValidActionWithSystem2(
 
         return False, fb_action, False, "swift"
 
+    if srm_gate is not None and response_plan:
+        # Explicit SRM gate hook; avoids changing return tuple shape.
+        prev_focus_target = getattr(srm_gate.focus, "focus_target", None)
+        srm_gate.set_focus_target_from_planning(response_plan)
+        logger.info(
+            f"[SRM Gate] planning focus target update: before={prev_focus_target} after={srm_gate.focus.focus_target}"
+        )
     # System 2 succeeded - original Swift failed, so found_valid_in_top=False
     return True, (real_action_list, guess_obs_list), False, "sage"
 

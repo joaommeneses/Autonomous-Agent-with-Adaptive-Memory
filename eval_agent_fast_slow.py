@@ -13,7 +13,8 @@ from scienceworld import ScienceWorldEnv
 from data_utils.data_utils import add_current_place, add_current_objects, sanitizeStr, formalize_action
 from data_utils.data_utils import compose_instance_v1, compose_instance_v1_1, compose_instance_v2, compose_instance_v3, compose_instance_v4
 from eval_utils import load_model, findValidActionNew, load_variation, get_model_output, findValidActionWithSystem2, getFilteredValidActions, sbert_search, clean_look, is_action_failed 
-from eval_utils import try_to_replace, rooms, clean_history, get_current_room, clean_obj_name, focus_on_count, rank_candidates_by_common_words, gpt_select_valid, is_redundant_action
+from eval_utils import try_to_replace, rooms, clean_history, get_current_room, clean_obj_name, focus_on_count, rank_candidates_by_common_words, gpt_select_valid
+from srm.srm_gate import SRMGate
 
 # AMM imports (used for EM writing and T3 retrieval, not for proactive Swift retrieval)
 from amm.config import DEFAULT_CONFIG
@@ -89,6 +90,35 @@ import logging
 from logging import INFO, WARN
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+MAX_SAGE_CALLS_PER_ENV_STEP = 1
+STUCK_K = 3
+SAGE_COOLDOWN_STEPS = 2
+
+
+def deterministic_fallback_action(valid_actions, current_room):
+    actions = sorted(list(valid_actions)) if valid_actions else []
+    if not actions:
+        return None
+    for preferred in ("look around", "inventory"):
+        if preferred in valid_actions:
+            return preferred
+    room_moves = []
+    for a in actions:
+        lower = a.lower()
+        dest = None
+        if lower.startswith("go to "):
+            dest = lower.replace("go to ", "", 1).strip()
+        elif lower.startswith("teleport to "):
+            dest = lower.replace("teleport to ", "", 1).strip()
+        elif lower.startswith("open door to "):
+            dest = lower.replace("open door to ", "", 1).strip()
+        if dest and dest != (current_room or "").lower():
+            room_moves.append((dest, a))
+    if room_moves:
+        room_moves.sort(key=lambda x: (x[0], x[1]))
+        return room_moves[0][1]
+    return actions[0]
 
 def get_file_name(args, task_num):
     if (len(args["output_path"]) > 0):
@@ -273,13 +303,34 @@ def eval(args, task_num, logger):
         swift_failure_count = 0
         srm_no_reward_streak = 0  # Track consecutive SRM actions with reward==0
         action_source = None  # Track action source: "swift" | "srm" | "sage" | "buffer"
-        noop_cooldown = set()  # Track actions that caused no-ops (cooldown for redundant actions)
+        sage_calls_this_env_step = 0
+        sage_calls_step_marker = step
+        same_state_sage_replan_streak = 0
+        last_sage_state_sig = None
+        disable_system2_until_step = -1
+        no_reward_streak = 0
+        repeat_obs_streak = 0
+        repeat_action_streak = 0
+        last_obs_text = ""
+        last_action_norm = ""
         pattern = r"focus on\s+(\b\w+\b(\s+\b\w+\b)*)"
         matches = re.findall(pattern, task_description)
         to_focus = [match[0].replace("the ", " ").strip() for match in matches]
         logger.info(f"to_focus={to_focus}")
+        srm_gate = SRMGate(debug=bool(args.get("srm_gate_debug", False))) if enable_srm else None
+        if srm_gate is not None:
+            focus_category = "substance" if any(tf.strip().lower() == "substance" for tf in to_focus) else None
+            srm_gate.set_focus_category(focus_category)
+            srm_gate.maybe_set_focus_target_from_task(task_description)
+            logger.info(
+                f"[SRM Gate] init focus_category={srm_gate.focus.focus_category} "
+                f"focus_target={srm_gate.focus.focus_target}"
+            )
         failed_messages = []
         while not done:           
+            if step != sage_calls_step_marker:
+                sage_calls_step_marker = step
+                sage_calls_this_env_step = 0
  
             # Per-iteration flag: track if action came from buffer (breaks Swift failure streak)
             picked_from_buffer = False
@@ -322,11 +373,6 @@ def eval(args, task_num, logger):
                 to_remove = []
                 # Try to use the actions in the buffer and see if any can be executed.
                 for action_ind, action_candidate in enumerate(action_buffer):
-                    if buffer_overall_trail >= 2 or (buffer_overall_trail >= 1 and action_candidate.startswith("focus on")):
-                        action_buffer = []
-                        obs_buffer = []
-                        break 
-                    
                     buffer_overall_trail += 1
                     if action_candidate.startswith("focus on") and focus_on_done:
                         logger.info(f"Removed {action_candidate} from the buffer, because the focus on limit exceed")
@@ -346,6 +392,29 @@ def eval(args, task_num, logger):
                     if action_buffer[action_ind] != action_candidate:
                         logger.info(f"Replace {action_buffer[action_ind]} --> {action_candidate}.")
                         # logger.info(f"validActions= {validActions}")
+
+                    # SRM Gate-1 (Milestone-1): validate/repair buffer actions before execution
+                    if srm_gate is not None:
+                        gate_state = {
+                            "look": info["look"],
+                            "inventory": str(info.get("inv", "")),
+                            "current_room": current_place,
+                            "valid_actions": list(validActions),
+                            "task_description": task_description,
+                            "buffer_next_actions": action_buffer[action_ind + 1:],
+                        }
+                        gate_decision = srm_gate.pre_execute(action_candidate, source="SAGE_BUFFER", state=gate_state)
+                        logger.info(
+                            f"[SRM Gate] src=SAGE_BUFFER raw='{action_candidate}' "
+                            f"norm='{gate_decision.normalized_action}' decision={gate_decision.kind} "
+                            f"reasons={gate_decision.reason_codes}"
+                        )
+                        if gate_decision.kind == "DROP_INVALID":
+                            to_remove.append(action_ind)
+                            continue
+                        if gate_decision.kind in ("REPAIR", "ACCEPT") and gate_decision.action_env:
+                            action_candidate = gate_decision.action_env
+                            action_buffer[action_ind] = action_candidate
 
                     if failed_action_trial.get(action_candidate, 0) >= 3:
                         logger.info(f"Removed {action_candidate} from the buffer because we have tried this action for 3 times.")
@@ -373,6 +442,26 @@ def eval(args, task_num, logger):
                     
                     action_candidate_v2 = obs_buffer[action_ind].lower() if formalize_action(obs_buffer[action_ind].lower()) is not None else None
                     action_candidate_v2 = None if action_candidate_v2 == action_candidate else action_candidate_v2
+
+                    if action_candidate_v2 and srm_gate is not None:
+                        gate_state_v2 = {
+                            "look": info["look"],
+                            "inventory": str(info.get("inv", "")),
+                            "current_room": current_place,
+                            "valid_actions": list(validActions),
+                            "task_description": task_description,
+                            "buffer_next_actions": action_buffer[action_ind + 1:],
+                        }
+                        gate_decision_v2 = srm_gate.pre_execute(action_candidate_v2, source="SAGE_BUFFER", state=gate_state_v2)
+                        logger.info(
+                            f"[SRM Gate] src=SAGE_BUFFER raw='{action_candidate_v2}' "
+                            f"norm='{gate_decision_v2.normalized_action}' decision={gate_decision_v2.kind} "
+                            f"reasons={gate_decision_v2.reason_codes}"
+                        )
+                        if gate_decision_v2.kind == "DROP_INVALID":
+                            action_candidate_v2 = None
+                        elif gate_decision_v2.kind in ("REPAIR", "ACCEPT") and gate_decision_v2.action_env:
+                            action_candidate_v2 = gate_decision_v2.action_env
                     
                     if action_candidate_v2 and action_candidate_v2 in validActions:
                         action_buffer.pop(action_ind)
@@ -393,6 +482,25 @@ def eval(args, task_num, logger):
                     for act_cand in action_trials:
                         if not act_cand:
                             continue 
+                        if srm_gate is not None:
+                            gate_state_trial = {
+                                "look": info["look"],
+                                "inventory": str(info.get("inv", "")),
+                                "current_room": current_place,
+                                "valid_actions": list(validActions),
+                                "task_description": task_description,
+                                "buffer_next_actions": action_buffer[action_ind + 1:],
+                            }
+                            gate_decision_trial = srm_gate.pre_execute(act_cand, source="SAGE_BUFFER", state=gate_state_trial)
+                            logger.info(
+                                f"[SRM Gate] src=SAGE_BUFFER raw='{act_cand}' "
+                                f"norm='{gate_decision_trial.normalized_action}' decision={gate_decision_trial.kind} "
+                                f"reasons={gate_decision_trial.reason_codes}"
+                            )
+                            if gate_decision_trial.kind == "DROP_INVALID":
+                                continue
+                            if gate_decision_trial.kind in ("REPAIR", "ACCEPT") and gate_decision_trial.action_env:
+                                act_cand = gate_decision_trial.action_env
                         obs_buf, reward_buf, done_buf, info_buf = env.step(act_cand)
                         # Log env step ground truth for buffer trial
                         current_place_buf = get_current_room(info_buf['look'])
@@ -425,7 +533,25 @@ def eval(args, task_num, logger):
                         buffer_overall_trail = 0
                         # Handle ambiguous requests for buffer-executed actions
                         if obs.startswith("Ambiguous request"):
-                            obs, reward_env, done, info = env.step("0")
+                            if srm_gate is not None:
+                                gate_state_amb = {
+                                    "look": info["look"],
+                                    "inventory": str(info.get("inv", "")),
+                                    "current_room": current_place,
+                                    "valid_actions": list(validActions),
+                                    "task_description": task_description,
+                                }
+                                gate_decision_amb = srm_gate.pre_execute("0", source="SAGE_BUFFER", state=gate_state_amb)
+                                logger.info(
+                                    f"[SRM Gate] src=SAGE_BUFFER raw='0' norm='{gate_decision_amb.normalized_action}' "
+                                    f"decision={gate_decision_amb.kind} reasons={gate_decision_amb.reason_codes}"
+                                )
+                                if gate_decision_amb.kind in ("REPAIR", "ACCEPT") and gate_decision_amb.action_env:
+                                    obs, reward_env, done, info = env.step(gate_decision_amb.action_env)
+                                else:
+                                    break
+                            else:
+                                obs, reward_env, done, info = env.step("0")
                             # Log ambiguous resolution step for buffer action
                             current_place_after_resolve = get_current_room(info['look'])
                             logger.info(f"[ENV_STEP] source=buffer executed_from_buffer=True action='0' reward={reward_env} score={info['score']} done={done} room={current_place_after_resolve} obs={obs[:160]}")
@@ -514,7 +640,7 @@ def eval(args, task_num, logger):
                         force_system_2_reason = "stuck_or_failed"
                         logger.info("Force to do force_system_2")
                     # If system 1 already focused on something and system 2 did not, switch to system 2
-                    if not system_2_focused and system_1_focused_trial >= 1:
+                    if (not enable_srm) and (not system_2_focused and system_1_focused_trial >= 1):
                         force_system_1 = False
                         force_system_2 = True            
                         force_system_2_reason = "focus_gate"  # Focus gating forces System 2
@@ -525,6 +651,9 @@ def eval(args, task_num, logger):
                         force_system_2 = False
                         force_system_2_reason = None
                         logger.info("Force to do force_system_1")
+                    if step < disable_system2_until_step:
+                        force_system_2 = False
+                        force_system_2_reason = None
                     # === BASELINE SWIFT PATH (when slow_agent=False) ===
                     if not args.get("slow_agent", False):
                         # Baseline Swift-only mode: no Sage, no AMM retrieval
@@ -532,13 +661,13 @@ def eval(args, task_num, logger):
                         predStrs = get_model_output(args, input_str, tokenizer, lm_model, device, logger)
                         ran_swift_this_step = True  # Swift ran in baseline path
                         
-                        # Baseline action selection: findValidActionNew (no AMM, no Sage)
+                        # Paper-aligned Swift selection: Top-1 only
                         validActions = getFilteredValidActions(env, info['look'], task_id=task_num, task_desc=task_description)
-                        action = findValidActionNew(predStrs, env, info['look'], recent_actions, sbert_model, logger)
+                        action = try_to_replace(predStrs[0], validActions, info['look'], info['inv']).strip() if predStrs else None
                         
-                        # Baseline validity check
+                        # Baseline validity check (Top-1 only)
                         found_valid_in_top = False
-                        for pred in predStrs[:5]:  # Check top 5 (baseline k=5)
+                        for pred in predStrs[:1]:
                             if pred.strip() in validActions:
                                 found_valid_in_top = True
                                 break
@@ -569,31 +698,43 @@ def eval(args, task_num, logger):
                         # Always call findValidActionWithSystem2 (it handles both Swift and Sage paths)
                         # This ensures found_valid_in_top is always defined
                         cycles_without_progress_val = wm.cycles_without_progress if (use_amm and wm is not None) else 0
-                    used_sys2, return_result, found_valid_in_top, action_source = findValidActionWithSystem2(
-                        predStrs, env, task_num, task_description, info['look'],
-                        recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
-                        demo_data, logger, sbert_model, step, last_time_system2_steps,
-                        useful_focus_on, focus_on_done, force_system_1, force_system_2,
-                        gpt_version, llm=llm,
-                        episodic_memories=None,  # AMM will handle memory retrieval in Phase 2
-                        use_memory_planning=use_memory_planning,
-                            amm_client=amm_client if use_amm else None,  # Pass AMM client only if enabled
-                        current_score=score,  # Current score for retrieval query
-                        recent_scores=recent_scores,  # Recent scores for retrieval query
-                        swift_failure_count=swift_failure_count,  # Pass swift_failure_count for T1 escalation
-                            cycles_without_progress=cycles_without_progress_val,  # Pass cycles_without_progress for T2 escalation
-                            force_system_2_reason=force_system_2_reason,  # Pass reason for forcing System 2 (to bypass T1 if focus_gate)
-                        # Parameters for second Swift pass (T1-S2 retry)
-                        args={**(args or {}), "srm_no_reward_streak": srm_no_reward_streak},
-                        tokenizer=tokenizer,
-                        lm_model=lm_model,
-                        device=device,
-                        compose_instance=compose_instance,
-                        prev_action=prev_action,
-                        prev_obs=prev_obs,
-                        objects=objects,
-                        places=places
-                    )
+                    if sage_calls_this_env_step >= MAX_SAGE_CALLS_PER_ENV_STEP:
+                        fallback_action = deterministic_fallback_action(validActions, current_place)
+                        logger.info(
+                            f"[LoopGuard] Sage call cap hit at step={step}. "
+                            f"Using deterministic fallback action='{fallback_action}'."
+                        )
+                        used_sys2 = False
+                        return_result = fallback_action
+                        found_valid_in_top = bool(fallback_action and fallback_action in validActions)
+                        action_source = "swift"
+                    else:
+                        used_sys2, return_result, found_valid_in_top, action_source = findValidActionWithSystem2(
+                            predStrs, env, task_num, task_description, info['look'],
+                            recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
+                            demo_data, logger, sbert_model, step, last_time_system2_steps,
+                            useful_focus_on, focus_on_done, force_system_1, force_system_2,
+                            gpt_version, llm=llm,
+                            episodic_memories=None,  # AMM will handle memory retrieval in Phase 2
+                            use_memory_planning=use_memory_planning,
+                                amm_client=amm_client if use_amm else None,  # Pass AMM client only if enabled
+                            current_score=score,  # Current score for retrieval query
+                            recent_scores=recent_scores,  # Recent scores for retrieval query
+                            swift_failure_count=swift_failure_count,  # Pass swift_failure_count for T1 escalation
+                                cycles_without_progress=cycles_without_progress_val,  # Pass cycles_without_progress for T2 escalation
+                                force_system_2_reason=force_system_2_reason,  # Pass reason for forcing System 2 (to bypass T1 if focus_gate)
+                            # Parameters for second Swift pass (T1-S2 retry)
+                            args={**(args or {}), "srm_no_reward_streak": srm_no_reward_streak},
+                            tokenizer=tokenizer,
+                            lm_model=lm_model,
+                            device=device,
+                            compose_instance=compose_instance,
+                            prev_action=prev_action,
+                            prev_obs=prev_obs,
+                            objects=objects,
+                            places=places,
+                            srm_gate=srm_gate
+                        )
                     
                     # Track if action was filtered by focus gating (before counter update)
                     swift_action_filtered = False
@@ -602,30 +743,16 @@ def eval(args, task_num, logger):
                         action = return_result
                         action_source = action_source if action_source else "swift"  # Default to swift if not set
                         consecutive_system2 = 0
+                        same_state_sage_replan_streak = 0
                         
                         # Check if this is a focus action that will be filtered by gating
-                        if action and action.startswith("focus on") and not system_2_focused:
+                        if (not enable_srm) and action and action.startswith("focus on") and not system_2_focused:
                             # Check if focus gating would reject this action
                             if system_1_focused_trial < 3 and not any([clean_obj_name(tf) in clean_obj_name(action) for tf in to_focus]):
                                 swift_action_filtered = True
-                                # Try alternative Swift predictions (non-focus actions)
-                                if ran_swift_this_step and predStrs:
-                                    validActions = getFilteredValidActions(env, info['look'], task_id=task_num, task_desc=task_description)
-                                    alternative_action = None
-                                    for pred in predStrs[1:]:  # Try predictions 1, 2, 3...
-                                        pred_repaired = try_to_replace(pred, validActions, info['look'], info['inv'])
-                                        if pred_repaired.strip() in validActions and not pred_repaired.strip().startswith("focus on"):
-                                            alternative_action = pred_repaired.strip()
-                                            logger.info(f"[FocusGate] Selected alternative Swift action='{alternative_action}' after skipping focus")
-                                            action = alternative_action
-                                            swift_action_filtered = False  # Found alternative, not filtered
-                                            break
-                                    
-                                    if swift_action_filtered:
-                                        # No alternative found, will be filtered
-                                        logger.info(f"[FocusGate] Swift proposed valid focus action but it is gated. trial={system_1_focused_trial}, matches_required={any([clean_obj_name(tf) in clean_obj_name(action) for tf in to_focus])}, decision=SKIP")
-                                        # Next iteration will force System 2 due to focus gate, which will bypass T1
-                                        logger.info("[FocusGate] No alternative non-focus action. Next iteration will force System 2 due to focus gate (bypassing T1).")
+                                logger.info(f"[FocusGate] Swift proposed valid focus action but it is gated. trial={system_1_focused_trial}, matches_required={any([clean_obj_name(tf) in clean_obj_name(action) for tf in to_focus])}, decision=SKIP")
+                                # No Top-2+ fallback in paper-aligned Top-1 mode.
+                                logger.info("[FocusGate] Top-1 focus action gated. No alternative Swift candidate will be tried in this step.")
                     
                     # Update swift_failure_count AFTER checking for focus filtering
                     # Only update counter when Swift is actually being used (not forced System 2) and architecture is enabled
@@ -656,6 +783,17 @@ def eval(args, task_num, logger):
                     else:
                         action = None 
                         action_source = "sage"  # System 2 was used
+                        sage_calls_this_env_step += 1
+                        sage_state_sig = (
+                            current_place or "",
+                            str(info.get("look", ""))[:200],
+                            str(info.get("inv", ""))[:80],
+                        )
+                        if sage_state_sig == last_sage_state_sig:
+                            same_state_sage_replan_streak += 1
+                        else:
+                            same_state_sage_replan_streak = 1
+                            last_sage_state_sig = sage_state_sig
                         action_buffer = return_result[0] # reset the buffer 
                         obs_buffer = return_result[1]
                         failed_messages = [] # reset the failed messages 
@@ -697,12 +835,12 @@ def eval(args, task_num, logger):
                     else:
                         swift_failure_count = 0
                     
-                    action = findValidActionNew(predStrs, env, info['look'], recent_actions, sbert_model, logger) 
+                    action = try_to_replace(predStrs[0], validActions, info['look'], info['inv']).strip() if predStrs else None
             
  
 
-            # Focus action was already executed, continue
-            if action.startswith("focus on") and focus_on_done:
+            # Focus action was already executed (legacy path only when SRM gate disabled)
+            if (not enable_srm) and action.startswith("focus on") and focus_on_done:
                 logger.info(f"You have already done great focus-on action: {useful_focus_on}. Skipping this [{action}]")
                 # Reset counter since this is a valid action (just already done)
                 if use_sage and args.get("slow_agent", False):
@@ -711,11 +849,11 @@ def eval(args, task_num, logger):
                 continue 
             
             # Sage handled the focus on action, and we mark the flag to prevent it from trying the same subgoal
-            if action.startswith("focus on") and consecutive_system2 > 0:
+            if (not enable_srm) and action.startswith("focus on") and consecutive_system2 > 0:
                 system_2_focused = True
                 
             # Swift is trying to focus on, system 2 hasnt proposed focus yet
-            if action.startswith("focus on") and not system_2_focused:
+            if (not enable_srm) and action.startswith("focus on") and not system_2_focused:
                 # track how many times swift tries to focus
                 system_1_focused_trial += 1
                 # only after 3 attempts or if the obeject its focusing on matches the task-relevant focus targets we allow it
@@ -733,55 +871,36 @@ def eval(args, task_num, logger):
                         pass
                     continue 
             
-            # Global redundant-action filter: check if action is redundant before execution
-            if action is not None and not executed:
-                if is_redundant_action(action, info['look'], recent_obs, recent_actions, noop_cooldown):
-                    logger.info(f"[RedundantAction] Skipping redundant action: '{action}'")
-                    # Try to find alternative action from Swift predictions if available
-                    if ran_swift_this_step and predStrs:
-                        validActions = getFilteredValidActions(env, info['look'], task_id=task_num, task_desc=task_description)
-                        alternative_action = None
-                        for pred in predStrs[1:]:  # Try predictions 1, 2, 3...
-                            pred_repaired = try_to_replace(pred, validActions, info['look'], info['inv'])
-                            if pred_repaired.strip() in validActions:
-                                if not is_redundant_action(pred_repaired.strip(), info['look'], recent_obs, recent_actions, noop_cooldown):
-                                    alternative_action = pred_repaired.strip()
-                                    logger.info(f"[RedundantAction] Selected alternative action='{alternative_action}'")
-                                    action = alternative_action
-                                    break
-                        
-                        if alternative_action is None:
-                            # All Swift candidates are redundant, try SRM if enabled
-                            from eval_utils import _ensure_srm_imported
-                            if enable_srm and not args.get("disable_srm", False):
-                                try:
-                                    srm_propose_action_func = _ensure_srm_imported(args, logger)
-                                    if srm_propose_action_func is not None:
-                                        valid_actions_list = list(validActions)
-                                        srm_action = srm_propose_action_func(
-                                            valid_actions=valid_actions_list,
-                                            task_description=task_description,
-                                            look=info['look'],
-                                            inventory=str(info['inv']) if info.get('inv') else "",
-                                            recent_actions=recent_actions,
-                                            recent_obs=recent_obs,
-                                            max_candidates=args.get("srm_max_candidates", 200),
-                                            recent_window=args.get("srm_recent_window", 5),
-                                        )
-                                        if srm_action and srm_action in validActions:
-                                            if not is_redundant_action(srm_action, info['look'], recent_obs, recent_actions, noop_cooldown):
-                                                logger.info(f"[RedundantAction] Using SRM alternative: '{srm_action}'")
-                                                action = srm_action
-                                                action_source = "srm"
-                                            else:
-                                                logger.info(f"[RedundantAction] SRM action also redundant: '{srm_action}'")
-                                                action = None
-                                except Exception:
-                                    pass  # SRM not available or failed
-                            
-                            if action is None or is_redundant_action(action, info['look'], recent_obs, recent_actions, noop_cooldown):
-                                logger.info(f"[RedundantAction] All candidates redundant, skipping step")
-                                continue
+            # SRM Gate-1 (Milestone-1): final pre-execution validation for Swift/Buffer/Sage-produced action
+            if action is not None and not executed and srm_gate is not None:
+                gate_state_final = {
+                    "look": info["look"],
+                    "inventory": str(info.get("inv", "")),
+                    "current_room": current_place,
+                    "valid_actions": list(validActions),
+                    "task_description": task_description,
+                    "swift_predictions": predStrs if (action_source or "swift") == "swift" else [],
+                }
+                gate_decision_final = srm_gate.pre_execute(
+                    action,
+                    source=(action_source or "swift").upper(),
+                    state=gate_state_final,
+                )
+                logger.info(
+                    f"[SRM Gate] src={(action_source or 'swift').upper()} raw='{action}' "
+                    f"norm='{gate_decision_final.normalized_action}' decision={gate_decision_final.kind} "
+                    f"reasons={gate_decision_final.reason_codes}"
+                )
+                if gate_decision_final.kind in ("REPAIR", "ACCEPT") and gate_decision_final.action_env:
+                    action = gate_decision_final.action_env
+                elif gate_decision_final.kind == "DROP_INVALID":
+                    if action_source == "swift":
+                        failed_messages.append(
+                            f"\t\t Failed action: (in {current_place}) [{action}] --> GATE_INVALID:{','.join(gate_decision_final.reason_codes)}"
+                        )
+                    # Top-1 only: if gate rejects, do not try Top-2+ in this step.
+                    logger.info("[SRM Gate] Action dropped/skipped before env.step.")
+                    continue
             
             # If the action was not already executed in the previous loop, execute it
             if not executed:
@@ -792,7 +911,26 @@ def eval(args, task_num, logger):
             
             # Handle ambiguous requests (resolve by choosing "0")
             if obs.startswith("Ambiguous request"):
-                obs, reward_env, done, info = env.step("0")
+                if srm_gate is not None:
+                    gate_state_amb2 = {
+                        "look": info["look"],
+                        "inventory": str(info.get("inv", "")),
+                        "current_room": current_place,
+                        "valid_actions": list(validActions),
+                        "task_description": task_description,
+                    }
+                    gate_decision_amb2 = srm_gate.pre_execute("0", source=(action_source or "swift").upper(), state=gate_state_amb2)
+                    logger.info(
+                        f"[SRM Gate] src={(action_source or 'swift').upper()} raw='0' "
+                        f"norm='{gate_decision_amb2.normalized_action}' decision={gate_decision_amb2.kind} "
+                        f"reasons={gate_decision_amb2.reason_codes}"
+                    )
+                    if gate_decision_amb2.kind in ("REPAIR", "ACCEPT") and gate_decision_amb2.action_env:
+                        obs, reward_env, done, info = env.step(gate_decision_amb2.action_env)
+                    else:
+                        continue
+                else:
+                    obs, reward_env, done, info = env.step("0")
                 # Log ambiguous resolution step
                 current_place_after_resolve = get_current_room(info['look'])
                 logger.info(f"[ENV_STEP] source={action_source or 'unknown'} executed_from_buffer=False action='0' reward={reward_env} score={info['score']} done={done} room={current_place_after_resolve} obs={obs[:160]}")
@@ -825,6 +963,39 @@ def eval(args, task_num, logger):
                     srm_no_reward_streak = 0  # Reset on any reward
             elif action_source != "srm":
                 srm_no_reward_streak = 0  # Reset if not SRM action
+
+            # Shared stuck detector state (baseline/SRM/AMM fairness)
+            no_reward_streak = (no_reward_streak + 1) if reward_true <= 0 else 0
+            obs_norm = sanitizeStr(obs)
+            action_norm = (action or "").strip().lower()
+            repeat_obs_streak = (repeat_obs_streak + 1) if obs_norm == last_obs_text else 1
+            repeat_action_streak = (repeat_action_streak + 1) if action_norm == last_action_norm else 1
+            last_obs_text = obs_norm
+            last_action_norm = action_norm
+
+            thermometer_wait_loop = (
+                repeat_action_streak >= STUCK_K
+                and repeat_obs_streak >= STUCK_K
+                and (
+                    action_norm.startswith("wait")
+                    or action_norm.startswith("use thermometer on")
+                )
+            )
+            stuck_triggered = (
+                (repeat_obs_streak >= STUCK_K and no_reward_streak >= STUCK_K)
+                or (same_state_sage_replan_streak >= 2)
+                or thermometer_wait_loop
+            )
+            if stuck_triggered:
+                logger.info(
+                    f"[LoopGuard] Stuck detected at step={step} "
+                    f"(no_reward_streak={no_reward_streak}, repeat_obs_streak={repeat_obs_streak}, "
+                    f"repeat_action_streak={repeat_action_streak}, same_state_sage_replan_streak={same_state_sage_replan_streak})."
+                )
+                action_buffer = []
+                obs_buffer = []
+                disable_system2_until_step = max(disable_system2_until_step, step + SAGE_COOLDOWN_STEPS)
+                same_state_sage_replan_streak = 0
             
             recent_reward.append(reward_true/100)
             # Note: swift_failure_count is now tracked based on found_valid_in_top (model-level invalidity)
@@ -998,6 +1169,8 @@ def eval(args, task_num, logger):
                 useful_focus_on.append(action)
                 if len(useful_focus_on) == max(focus_on_count[str(task_num)], task_description.count("focus")):
                     focus_on_done = True 
+            if srm_gate is not None:
+                srm_gate.mark_focus_executed(action, obs)
 
             # Apply score modification logic (for display/evaluation, not for memory)
             # Note: Memory was already written with TRUE values above
@@ -1096,6 +1269,7 @@ def parse_args():
     parser.add_argument("--use_memory_planning", action="store_true", default=True)
     parser.add_argument("--use_amm", action="store_true", default=False, help="Enable AMM (Adaptive Memory Module) retrieval and writing. Sage/System 2 is always available when slow_agent=True.")
     parser.add_argument("--disable_srm", action="store_true", default=False, help="Disable SRM (Self-Reflection Module).")
+    parser.add_argument("--srm_gate_debug", action="store_true", default=False, help="Enable debug logs for SRM Gate-1 validate/repair decisions.")
     parser.add_argument("--srm_max_candidates", type=int, default=200, help="SRM: Maximum number of action candidates to consider (hard cap for efficiency).")
     parser.add_argument("--srm_recent_window", type=int, default=5, help="SRM: Number of recent actions to check for scoring.")
     args = parser.parse_args()
