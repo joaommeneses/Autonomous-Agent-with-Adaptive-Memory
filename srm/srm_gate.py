@@ -1,4 +1,3 @@
-import re
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -14,42 +13,6 @@ class FocusTracker:
     already_focused: bool = False
 
 
-def extract_focus_target(planning_text: str, focus_category: Optional[str]) -> Optional[str]:
-    text = planning_text or ""
-    if not focus_category:
-        return None
-
-    cat = focus_category.lower().strip()
-    if cat != "substance":
-        return None
-
-    # Prefer section-based extraction: "Substance:" / "Substances:"
-    section = re.search(r"(?is)\bsubstances?\s*:\s*(.+?)(?:\n\s*\n|$)", text)
-    if section:
-        lines = [ln.strip() for ln in section.group(1).splitlines() if ln.strip()]
-        for ln in lines:
-            ln = re.sub(r"^[\-\*\d\.\)\s]+", "", ln).strip()
-            ln = re.sub(r"\(.*?\)", "", ln).strip()
-            if ln:
-                return re.sub(r"\s+", " ", ln.lower())
-    return None
-
-
-def extract_focus_target_from_task(task_description: str, focus_category: Optional[str]) -> Optional[str]:
-    if (focus_category or "").lower() != "substance":
-        return None
-    text = (task_description or "").lower()
-    patterns = [
-        r"\bboil\s+([a-z][a-z\s\-]+?)(?:\bwith\b|\bin\b|,|\.|$)",
-        r"\bfocus on\s+([a-z][a-z\s\-]+?)(?:\bwith\b|\bin\b|,|\.|$)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text)
-        if m:
-            return re.sub(r"\s+", " ", m.group(1)).strip()
-    return None
-
-
 class SRMGate:
     def __init__(self, debug: bool = False):
         self.validator = ActionValidator()
@@ -58,26 +21,20 @@ class SRMGate:
         self.debug = debug
 
     def set_focus_category(self, focus_category: Optional[str]):
+        # No automatic category inference in M1 finalization.
         self.focus.focus_category = focus_category
 
     def maybe_set_focus_target_from_planning(self, planning_text: str):
-        if self.focus.focus_target:
-            return
-        target = extract_focus_target(planning_text, self.focus.focus_category)
-        if target:
-            self.focus.focus_target = target
+        # Disabled by design: no focus_target inference from planning text.
+        return
 
     def set_focus_target_from_planning(self, planning_text: str, focus_category: Optional[str] = None):
-        if focus_category:
-            self.set_focus_category(focus_category)
-        self.maybe_set_focus_target_from_planning(planning_text)
+        # Disabled by design: no focus_target inference from planning text.
+        return
 
     def maybe_set_focus_target_from_task(self, task_description: str):
-        if self.focus.focus_target:
-            return
-        target = extract_focus_target_from_task(task_description, self.focus.focus_category)
-        if target:
-            self.focus.focus_target = target
+        # Disabled by design: no focus_target inference from task text.
+        return
 
     def mark_focus_executed(self, action: str, obs: str):
         obs_l = (obs or "").lower()
@@ -108,9 +65,15 @@ class SRMGate:
                 source=source,
             )
 
-        # Short-circuit repeated focus once task focus is already complete.
-        if parsed.verb == "focus" and self.focus.already_focused:
-            validation = ValidationResult(status="INVALID", reason_codes=["FOCUS_ALREADY_DONE"])
+        # Shared per-task focus cap guard (applies to Swift/Sage/Buffer/repair paths).
+        # We enforce this here so one gate controls all action sources.
+        if parsed.verb == "focus":
+            focus_limit = state2.get("focus_limit")
+            focus_used = state2.get("focus_used", 0)
+            if focus_limit is not None and focus_used is not None and int(focus_used) >= int(focus_limit):
+                validation = ValidationResult(status="INVALID", reason_codes=["FOCUS_LIMIT_EXCEEDED"])
+            else:
+                validation = self.validator.validate(parsed, state2)
         else:
             validation = self.validator.validate(parsed, state2)
 

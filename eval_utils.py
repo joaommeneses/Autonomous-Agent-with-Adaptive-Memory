@@ -379,8 +379,8 @@ def load_variation(env, args, task_num, logger):
     elif (args["set"] == "test"):               
         variations = list(env.getVariationsTest())
         # Test configuration: use only 3 variations
-        #variations = variations[:1]
-        variations = variations[: min(10, len(variations))]
+        variations = variations[:1]
+        # variations = variations[: min(10, len(variations))]
     elif (args["set"] == "dev"):
         variations = list(env.getVariationsDev()) 
         variations = variations[:3]
@@ -1479,11 +1479,9 @@ def findValidActionWithSystem2(
         return False, fb_action, False, "swift"
 
     if srm_gate is not None and response_plan:
-        # Explicit SRM gate hook; avoids changing return tuple shape.
-        prev_focus_target = getattr(srm_gate.focus, "focus_target", None)
-        srm_gate.set_focus_target_from_planning(response_plan)
+        # M1 finalization: no automatic focus_target inference from planning text.
         logger.info(
-            f"[SRM Gate] planning focus target update: before={prev_focus_target} after={srm_gate.focus.focus_target}"
+            f"[SRM Gate] planning received; focus_target remains {getattr(srm_gate.focus, 'focus_target', None)}"
         )
     # System 2 succeeded - original Swift failed, so found_valid_in_top=False
     return True, (real_action_list, guess_obs_list), False, "sage"

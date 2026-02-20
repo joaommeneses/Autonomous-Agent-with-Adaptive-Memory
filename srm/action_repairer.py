@@ -37,7 +37,7 @@ class ActionRepairer:
             )
 
         reason_codes = validation_result.reason_codes or []
-        if "FOCUS_ALREADY_DONE" in reason_codes:
+        if "FOCUS_ALREADY_DONE" in reason_codes or "FOCUS_LIMIT_EXCEEDED" in reason_codes or "FOCUS_LIMIT_REACHED" in reason_codes:
             source = (state.get("source") or "").lower()
             valid_actions = list(state.get("valid_actions") or [])
             if source.startswith("swift"):

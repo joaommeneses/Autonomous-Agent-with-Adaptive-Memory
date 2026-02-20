@@ -1,3 +1,4 @@
+import re
 from typing import Dict, List, Optional, Set
 
 from .action_types import ALLOWED_VERBS, ParsedAction, ValidationResult, to_env_action
@@ -25,14 +26,47 @@ ARITY = {
 }
 
 
+def _norm_text(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
 def _contains_obj(text: str, obj: str) -> bool:
     return obj and obj.lower() in (text or "").lower()
+
+
+OBS_STOPWORDS = {
+    "the", "a", "an", "in", "on", "to", "of", "called", "containing",
+    "currently", "reading", "degrees", "celsius", "room", "see", "also",
+    "door", "open", "closed", "inventory", "nothing", "agent", "substance",
+}
+
+
+def _tokenize_observation_text(text: str) -> Set[str]:
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+    tokens = set()
+    for token in cleaned.split():
+        if len(token) < 3:
+            continue
+        if token in OBS_STOPWORDS:
+            continue
+        tokens.add(token)
+    return tokens
 
 
 def _is_target_observed(target: str, valid_actions: Optional[Set[str]], look: str, inventory: str) -> bool:
     if not target:
         return False
     target_l = target.lower()
+
+    # Special placeholder handling: "substance in inventory"
+    # Accept if focus action exists in valid actions OR inventory actually contains a substance entry.
+    if _norm_text(target_l) == "substance in inventory":
+        if valid_actions and "focus on substance in inventory" in {a.lower() for a in valid_actions}:
+            return True
+        if re.search(r"a substance called\s+\w+", inventory or "", flags=re.IGNORECASE):
+            return True
+
+    # Fast path 1: valid-actions cues (excluding direct focus self-proof)
     if valid_actions:
         focus_prefix = f"focus on {target_l}"
         for a in valid_actions:
@@ -43,8 +77,25 @@ def _is_target_observed(target: str, valid_actions: Optional[Set[str]], look: st
                 continue
             if al.startswith("pick up ") or al.startswith("take ") or al.startswith("examine ") or " on " in al:
                 return True
+
+    # Fast path 2: verbatim mention in look/inventory.
+    if _contains_obj(look, target_l) or _contains_obj(inventory, target_l):
+        return True
+
+    # Token-overlap fallback for non-verbatim but semantically present targets.
+    target_tokens = _tokenize_observation_text(target_l)
+    if not target_tokens:
         return False
-    return _contains_obj(look, target_l) or _contains_obj(inventory, target_l)
+
+    context_text = f"{look} {inventory}"
+    if valid_actions:
+        non_focus_actions = [a for a in valid_actions if not a.lower().startswith("focus on ")]
+        context_text = f"{context_text} {' '.join(non_focus_actions)}"
+    context_tokens = _tokenize_observation_text(context_text)
+    overlap_count = len(target_tokens & context_tokens)
+
+    required_overlap = 1 if len(target_tokens) <= 2 else 2
+    return overlap_count >= required_overlap
 
 
 def _open_noop(obj: str, valid_actions: Set[str]) -> bool:
@@ -65,9 +116,7 @@ class ActionValidator:
         valid_actions = set(state.get("valid_actions") or [])
         look = state.get("look", "") or ""
         inventory = state.get("inventory", "") or ""
-        focus_category = state.get("focus_category")
         focus_target = state.get("focus_target")
-        already_focused = bool(state.get("already_focused", False))
 
         if verb not in ALLOWED_VERBS:
             return ValidationResult(status="INVALID", reason_codes=["VERB_NOT_ALLOWED"])
@@ -80,13 +129,11 @@ class ActionValidator:
             return ValidationResult(status="INVALID", reason_codes=["ARITY_MISMATCH"])
 
         if verb == "focus":
-            target = args[0].lower().strip() if args else ""
-            if already_focused:
-                return ValidationResult(status="INVALID", reason_codes=["FOCUS_ALREADY_DONE"])
-            if focus_category == "substance" and not target:
-                return ValidationResult(status="INVALID", reason_codes=["FOCUS_TARGET_MISSING"])
-            if focus_target and target != focus_target.lower().strip():
+            target = _norm_text(args[0]) if args else ""
+            # Exact equality is enforced only when an explicit focus_target is externally set.
+            if focus_target and target != _norm_text(focus_target):
                 return ValidationResult(status="INVALID", reason_codes=["FOCUS_WRONG_TARGET"])
+            # Always require target to be observed/actionable in current context.
             if not _is_target_observed(target, valid_actions if valid_actions else None, look, inventory):
                 return ValidationResult(status="INVALID", reason_codes=["FOCUS_TARGET_NOT_OBSERVED_YET"])
 
