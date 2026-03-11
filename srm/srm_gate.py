@@ -14,11 +14,10 @@ class FocusTracker:
 
 
 class SRMGate:
-    def __init__(self, debug: bool = False):
+    def __init__(self):
         self.validator = ActionValidator()
         self.repairer = ActionRepairer()
         self.focus = FocusTracker()
-        self.debug = debug
 
     def set_focus_category(self, focus_category: Optional[str]):
         # No automatic category inference in M1 finalization.

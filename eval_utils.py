@@ -22,64 +22,37 @@ import tiktoken
 from typing import List, Dict, Any, Optional, Set
 
 from slow_agent import local_llm
+def call_system2(
+    prompt: str,
+    llm_client=None,
+    logger=None,
+    max_tokens: int = 1024,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+) -> str:
+    """
+    Shared System-2 text generation helper used by Sage/Critic.
+    Uses Qwen-vLLM when llm_client is None, otherwise uses local_llm wrapper.
+    Returns assistant text as a plain string.
+    """
+    if llm_client is None:
+        return qwen_completion_vllm(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            logger=logger,
+        )
 
-# SRM import - robust import with clear error handling
-srm_propose_action = None
-def _import_srm_module():
-    """Import SRM module with fallback attempts and clear error reporting."""
-    global srm_propose_action
-    if srm_propose_action is not None:
-        return srm_propose_action
-    
-    import sys
-    import traceback
-    
-    # Try primary import path
+    # Keep compatibility with local wrapper return types.
     try:
-        from srm.srm_module import propose_action as srm_propose_action
-        return srm_propose_action
-    except ImportError as e1:
-        # Try alternative import path (if srm_module.py is at root)
-        try:
-            import importlib.util
-            import os
-            # Check if srm directory exists
-            srm_path = os.path.join(os.path.dirname(__file__), 'srm', 'srm_module.py')
-            if os.path.exists(srm_path):
-                spec = importlib.util.spec_from_file_location("srm_module", srm_path)
-                srm_module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(srm_module)
-                srm_propose_action = srm_module.propose_action
-                return srm_propose_action
-        except Exception as e2:
-            pass
-    
-    # If all imports failed, return None (will be checked later)
-    return None
+        response = local_llm.generate(prompt, logger=logger) if logger else local_llm.generate(prompt)
+    except TypeError:
+        response = local_llm.generate(prompt)
 
-def _ensure_srm_imported(args, logger):
-    """Ensure SRM is imported if enabled, fail loudly if import fails."""
-    global srm_propose_action
-    
-    # Check if SRM is enabled
-    enable_srm = not bool(args.get("disable_srm", False)) if args else True
-    
-    if not enable_srm:
-        # SRM is disabled, that's fine
-        return None
-    
-    # SRM is enabled - must be importable
-    if srm_propose_action is None:
-        import traceback
-        srm_propose_action = _import_srm_module()
-        
-        if srm_propose_action is None:
-            error_msg = "[SRM][IMPORT] Failed to import SRM module. SRM is enabled, aborting.\n"
-            error_msg += traceback.format_exc()
-            logger.error(error_msg)
-            raise ImportError("SRM module import failed but SRM is enabled. Check SRM installation and paths.")
-    
-    return srm_propose_action
+    if isinstance(response, list):
+        return response[0] if response else ""
+    return str(response or "")
 
 action_type_description = [
     {"action_type": "WAIT()", "desc": "wait for something to be done, for example, an object on stove to be boiled"},
@@ -378,9 +351,8 @@ def load_variation(env, args, task_num, logger):
     # Use the number of variations if less than 10, use 10 if more than 10
     elif (args["set"] == "test"):               
         variations = list(env.getVariationsTest())
-        # Test configuration: use only 3 variations
-        variations = variations[:1]
-        # variations = variations[: min(10, len(variations))]
+        #variations = variations[: min(10, len(variations))]
+        variations = variations[:10]
     elif (args["set"] == "dev"):
         variations = list(env.getVariationsDev()) 
         variations = variations[:3]
@@ -1480,9 +1452,7 @@ def findValidActionWithSystem2(
 
     if srm_gate is not None and response_plan:
         # M1 finalization: no automatic focus_target inference from planning text.
-        logger.info(
-            f"[SRM Gate] planning received; focus_target remains {getattr(srm_gate.focus, 'focus_target', None)}"
-        )
+        pass
     # System 2 succeeded - original Swift failed, so found_valid_in_top=False
     return True, (real_action_list, guess_obs_list), False, "sage"
 

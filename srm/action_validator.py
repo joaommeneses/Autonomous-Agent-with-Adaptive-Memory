@@ -1,5 +1,5 @@
 import re
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Set
 
 from .action_types import ALLOWED_VERBS, ParsedAction, ValidationResult, to_env_action
 
@@ -34,68 +34,45 @@ def _contains_obj(text: str, obj: str) -> bool:
     return obj and obj.lower() in (text or "").lower()
 
 
-OBS_STOPWORDS = {
-    "the", "a", "an", "in", "on", "to", "of", "called", "containing",
-    "currently", "reading", "degrees", "celsius", "room", "see", "also",
-    "door", "open", "closed", "inventory", "nothing", "agent", "substance",
+_OBS_STOPWORDS = {
+    "a", "an", "the", "in", "on", "to", "from", "of", "and", "or",
+    "called", "there", "is",
 }
 
 
-def _tokenize_observation_text(text: str) -> Set[str]:
-    cleaned = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
-    tokens = set()
-    for token in cleaned.split():
-        if len(token) < 3:
-            continue
-        if token in OBS_STOPWORDS:
-            continue
-        tokens.add(token)
-    return tokens
+def _normalize_world_text(text: str) -> str:
+    s = (text or "").lower()
+    for phrase in ("a substance called", "substance called", "there is a", "there is an", "there is the"):
+        s = s.replace(phrase, " ")
+    s = s.replace("-", " ")
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
-def _is_target_observed(target: str, valid_actions: Optional[Set[str]], look: str, inventory: str) -> bool:
-    if not target:
+def _extract_content_tokens(phrase: str) -> List[str]:
+    norm = _normalize_world_text(phrase)
+    if not norm:
+        return []
+    return [tok for tok in norm.split() if tok and tok not in _OBS_STOPWORDS]
+
+
+def _is_phrase_observed(phrase: str, look: str, inventory: str) -> bool:
+    tokens = _extract_content_tokens(phrase)
+    if not tokens:
         return False
-    target_l = target.lower()
 
-    # Special placeholder handling: "substance in inventory"
-    # Accept if focus action exists in valid actions OR inventory actually contains a substance entry.
-    if _norm_text(target_l) == "substance in inventory":
-        if valid_actions and "focus on substance in inventory" in {a.lower() for a in valid_actions}:
-            return True
-        if re.search(r"a substance called\s+\w+", inventory or "", flags=re.IGNORECASE):
-            return True
-
-    # Fast path 1: valid-actions cues (excluding direct focus self-proof)
-    if valid_actions:
-        focus_prefix = f"focus on {target_l}"
-        for a in valid_actions:
-            al = a.lower()
-            if target_l not in al:
-                continue
-            if al.startswith(focus_prefix):
-                continue
-            if al.startswith("pick up ") or al.startswith("take ") or al.startswith("examine ") or " on " in al:
-                return True
-
-    # Fast path 2: verbatim mention in look/inventory.
-    if _contains_obj(look, target_l) or _contains_obj(inventory, target_l):
+    ctx_norm = _normalize_world_text(f"{look}\n{inventory}")
+    target_norm = " ".join(tokens)
+    if target_norm and target_norm in ctx_norm:
         return True
 
-    # Token-overlap fallback for non-verbatim but semantically present targets.
-    target_tokens = _tokenize_observation_text(target_l)
-    if not target_tokens:
-        return False
+    ctx_tokens = set(ctx_norm.split())
+    return all(tok in ctx_tokens for tok in tokens)
 
-    context_text = f"{look} {inventory}"
-    if valid_actions:
-        non_focus_actions = [a for a in valid_actions if not a.lower().startswith("focus on ")]
-        context_text = f"{context_text} {' '.join(non_focus_actions)}"
-    context_tokens = _tokenize_observation_text(context_text)
-    overlap_count = len(target_tokens & context_tokens)
 
-    required_overlap = 1 if len(target_tokens) <= 2 else 2
-    return overlap_count >= required_overlap
+def _is_target_observed(target: str, look: str, inventory: str) -> bool:
+    return _is_phrase_observed(target, look, inventory)
 
 
 def _open_noop(obj: str, valid_actions: Set[str]) -> bool:
@@ -134,7 +111,7 @@ class ActionValidator:
             if focus_target and target != _norm_text(focus_target):
                 return ValidationResult(status="INVALID", reason_codes=["FOCUS_WRONG_TARGET"])
             # Always require target to be observed/actionable in current context.
-            if not _is_target_observed(target, valid_actions if valid_actions else None, look, inventory):
+            if not _is_target_observed(target, look, inventory):
                 return ValidationResult(status="INVALID", reason_codes=["FOCUS_TARGET_NOT_OBSERVED_YET"])
 
         env_action = to_env_action(parsed_action, valid_actions=valid_actions if valid_actions else None)

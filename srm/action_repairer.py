@@ -37,6 +37,25 @@ class ActionRepairer:
             )
 
         reason_codes = validation_result.reason_codes or []
+        if (
+            parsed_action is not None
+            and parsed_action.verb == "focus"
+            and (
+                "FOCUS_TARGET_NOT_OBSERVED_YET" in reason_codes
+                or "NOT_IN_VALID_ACTIONS" in reason_codes
+            )
+        ):
+            valid_actions = list(state.get("valid_actions") or [])
+            inventory_text = str(state.get("inventory") or "").lower()
+            target = (parsed_action.args[0] if parsed_action.args else "").strip().lower()
+            alias_action = "focus on substance in inventory"
+            if target and target in inventory_text and alias_action in valid_actions:
+                return RepairOutcome(
+                    kind="REPAIRED",
+                    action_env=alias_action,
+                    reason_codes=reason_codes + ["FOCUS_INVENTORY_ALIAS"],
+                )
+
         if "FOCUS_ALREADY_DONE" in reason_codes or "FOCUS_LIMIT_EXCEEDED" in reason_codes or "FOCUS_LIMIT_REACHED" in reason_codes:
             source = (state.get("source") or "").lower()
             valid_actions = list(state.get("valid_actions") or [])

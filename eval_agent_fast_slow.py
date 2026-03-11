@@ -4,11 +4,11 @@ import re
 import time
 import json
 import copy
+import hashlib
 import torch
 import random
 import argparse
 from tqdm import trange
-from collections import defaultdict
 from scienceworld import ScienceWorldEnv
 from data_utils.data_utils import add_current_place, add_current_objects, sanitizeStr, formalize_action
 from data_utils.data_utils import compose_instance_v1, compose_instance_v1_1, compose_instance_v2, compose_instance_v3, compose_instance_v4
@@ -16,6 +16,13 @@ from eval_utils import load_model, findValidActionNew, load_variation, get_model
 from eval_utils import try_to_replace, rooms, clean_history, get_current_room, clean_obj_name, focus_on_count
 from srm.srm_gate import SRMGate
 from srm.action_types import normalize_action_text, parse_action
+from srm.stagnation import SRMStagnationDetector
+from srm.critic import (
+    build_critic_prompt,
+    filter_valid_actions_for_critic_with_stats,
+    parse_critic_actions,
+    run_critic_once,
+)
 
 # AMM imports (used for EM writing and T3 retrieval, not for proactive Swift retrieval)
 from amm.config import DEFAULT_CONFIG
@@ -95,6 +102,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MAX_SAGE_CALLS_PER_ENV_STEP = 1
 STUCK_K = 3
 SAGE_COOLDOWN_STEPS = 2
+MAX_CRITIC_CALLS_PER_EPISODE = 6
+CRITIC_COOLDOWN_STEPS = 5
+CRITIC_BACKOFF_STEPS = 10
 
 
 def deterministic_fallback_action(valid_actions, current_room):
@@ -120,6 +130,33 @@ def deterministic_fallback_action(valid_actions, current_room):
         room_moves.sort(key=lambda x: (x[0], x[1]))
         return room_moves[0][1]
     return actions[0]
+
+
+def _inventory_signature_for_critic(inventory_text):
+    lines = (inventory_text or "").splitlines()
+    kept = []
+    for line in lines:
+        item = line.strip().lower()
+        if not item:
+            continue
+        if item.startswith("in your inventory") or item.startswith("your inventory"):
+            continue
+        kept.append(item)
+    kept.sort()
+    return "|".join(kept)
+
+
+def _critic_state_sig(room, inventory_text, obs):
+    room_sig = (room or "").strip().lower()
+    inv_sig = _inventory_signature_for_critic(inventory_text)
+    obs_sig = sanitizeStr(obs or "").strip().lower()[:120]
+    return (room_sig, inv_sig, obs_sig)
+
+
+def _critic_actions_hash(actions):
+    norm = [normalize_action_text(a or "").strip().lower() for a in actions]
+    joined = "||".join(norm)
+    return hashlib.sha1(joined.encode("utf-8")).hexdigest()
 
 def get_file_name(args, task_num):
     if (len(args["output_path"]) > 0):
@@ -196,17 +233,19 @@ def eval(args, task_num, logger):
     # === FEATURE FLAGS: Control AMM and SRM architecture ===
     # Sage/System 2 is always enabled (controlled by slow_agent flag)
     # When use_amm=False: baseline SwiftSage mode (no AMM, but Sage available)
-    use_amm = args.get("use_amm", False)  # Enable AMM retrieval/writing
+    enable_amm = bool(args.get("use_amm", False))
+    amm_write_only = bool(args.get("amm_write_only", False))
+    amm_retrieval_enabled = enable_amm and (not amm_write_only)
     use_sage = True  # Sage/System 2 is always enabled (requires slow_agent=True)
     enable_srm = not args.get("disable_srm", False)  # Enable SRM (Self-Reflection Module), disabled via --disable_srm
-    srm_max_candidates = args.get("srm_max_candidates", 200)  # SRM: max candidates to consider
-    srm_recent_window = args.get("srm_recent_window", 5)  # SRM: recent actions window for scoring
+    if amm_write_only and not enable_amm:
+        logger.warning("[AMM] --amm_write_only has no effect because AMM is disabled (--use_amm not set)")
     # =========================================================
 
     # === AMM INIT (only when use_amm=True) ===
     amm_client = None
     wm = None
-    if use_amm:
+    if enable_amm:
         from amm.client_letta import AMMLettaClient, LettaConfig
         from amm.working_memory import WorkingMemory
         from amm.writer import write_success, write_nearmiss, write_avoidance, create_memory_record
@@ -248,10 +287,14 @@ def eval(args, task_num, logger):
         logger.info(f"task_description = {task_description}")
         
         # === AMM HOOK: EPISODE RESET (only when use_amm=True) ===
-        if use_amm and wm is not None:
+        if enable_amm and wm is not None:
             wm.reset()
             wm.pending_subgoal = task_description
             logger.info(f"[AMM] Working memory reset for new episode: {task_description[:50]}...")
+            if amm_write_only:
+                logger.info("[AMM] Mode=WRITE_ONLY (writes enabled, retrieval+augmentation disabled)")
+            else:
+                logger.info("[AMM] Mode=FULL (writes + retrieval/augmentation enabled)")
         # ================================
         # task_description = env.taskdescription()  
         recent_actions = ["look around"]
@@ -292,7 +335,7 @@ def eval(args, task_num, logger):
  
         action_buffer = []
         obs_buffer = [] # guess_obs_list
-        failed_action_trial = defaultdict(lambda: 0)
+        buffer_owner = None  # None | "sage" | "critic"
         last_time_system2_steps = [-1]
         last_time_system2 = -1
         consecutive_system2 = 0
@@ -302,13 +345,19 @@ def eval(args, task_num, logger):
         system_2_focused = False
         system_1_focused_trial = 0
         swift_failure_count = 0
-        srm_no_reward_streak = 0  # Track consecutive SRM actions with reward==0
-        action_source = None  # Track action source: "swift" | "srm" | "sage" | "buffer"
+        if enable_srm:
+            gate_drop_streak = 0
+            gate_drop_step = -1
+            force_system2_once_reason = None
+        else:
+            gate_drop_streak = None
+            gate_drop_step = None
+            force_system2_once_reason = None
+        action_source = None  # Track action source: "swift" | "sage" | "buffer"
         focus_limit = int(focus_on_count.get(str(task_num), 1))
         focus_used = 0
         sage_calls_this_env_step = 0
         sage_calls_step_marker = step
-        dropped_by_gate_this_step = 0
         same_state_sage_replan_streak = 0
         last_sage_state_sig = None
         disable_system2_until_step = -1
@@ -321,17 +370,36 @@ def eval(args, task_num, logger):
         matches = re.findall(pattern, task_description)
         to_focus = [match[0].replace("the ", " ").strip() for match in matches]
         logger.info(f"to_focus={to_focus}")
-        srm_gate = SRMGate(debug=bool(args.get("srm_gate_debug", False))) if enable_srm else None
+        srm_gate = SRMGate() if enable_srm else None
+        if enable_srm:
+            stagnation_detector = SRMStagnationDetector()
+            critic_calls = 0
+            last_critic_step = -10**9
+            last_critic_state_sig = None
+            last_critic_actions_hash = ""
+            disable_critic_until_step = -1
+            pending_critic_report = None
+            pending_critic_step = -1
+        else:
+            stagnation_detector = None
+            critic_calls = None
+            last_critic_step = None
+            last_critic_state_sig = None
+            last_critic_actions_hash = None
+            disable_critic_until_step = None
+            pending_critic_report = None
+            pending_critic_step = None
         failed_messages = []
-        logger.info(f"[FOCUS_LIMIT] task={task_num} used={focus_used}/{focus_limit}")
+        if enable_srm:
+            logger.info(f"[FOCUS_LIMIT] task={task_num} used={focus_used}/{focus_limit}")
         while not done:           
             if step != sage_calls_step_marker:
                 sage_calls_step_marker = step
                 sage_calls_this_env_step = 0
-                dropped_by_gate_this_step = 0
  
             # Per-iteration flag: track if action came from buffer (breaks Swift failure streak)
             picked_from_buffer = False
+            executed_buffer_owner = None
 
             no_action_done += 1 
             
@@ -374,12 +442,15 @@ def eval(args, task_num, logger):
                     scanned += 1
                     action_candidate_raw = action_buffer[0]
                     obs_candidate_raw = obs_buffer[0] if obs_buffer else ""
+                    current_buffer_owner = buffer_owner
 
                     if action_candidate_raw.startswith("focus on") and focus_on_done:
                         logger.info(f"Removed {action_candidate_raw} from the buffer, because the focus on limit exceed")
                         action_buffer.pop(0)
                         if obs_buffer:
                             obs_buffer.pop(0)
+                        if not action_buffer:
+                            buffer_owner = None
                         continue
 
                     action_candidate = try_to_replace(action_candidate_raw, validActions, info['look'], info['inv'])
@@ -390,7 +461,7 @@ def eval(args, task_num, logger):
                     if srm_gate is not None:
                         gate_state = {
                             "look": info["look"],
-                            "inventory": str(info.get("inv", "")),
+                            "inventory": str(env.inventory()),
                             "current_room": current_place,
                             "valid_actions": list(validActions),
                             "task_description": task_description,
@@ -399,11 +470,12 @@ def eval(args, task_num, logger):
                             "focus_used": focus_used,
                         }
                         gate_decision = srm_gate.pre_execute(action_candidate, source="SAGE_BUFFER", state=gate_state)
-                        logger.info(
-                            f"[SRM Gate] src=SAGE_BUFFER raw='{action_candidate}' "
-                            f"norm='{gate_decision.normalized_action}' decision={gate_decision.kind} "
-                            f"reasons={gate_decision.reason_codes}"
-                        )
+                        if gate_decision.kind != "ACCEPT" or (gate_decision.reason_codes or []):
+                            logger.info(
+                                f"[SRM Gate] src=SAGE_BUFFER raw='{action_candidate}' "
+                                f"norm='{gate_decision.normalized_action}' decision={gate_decision.kind} "
+                                f"reasons={gate_decision.reason_codes}"
+                            )
                         if "FOCUS_LIMIT_EXCEEDED" in (gate_decision.reason_codes or []) or "FOCUS_LIMIT_REACHED" in (gate_decision.reason_codes or []):
                             logger.info(
                                 f"[FOCUS_LIMIT] task={task_num} used={focus_used}/{focus_limit} "
@@ -413,7 +485,6 @@ def eval(args, task_num, logger):
                             reason_codes = gate_decision.reason_codes or []
                             parsed_head = parse_action(normalize_action_text(action_candidate_raw))
                             is_focus_head = parsed_head is not None and parsed_head.verb == "focus"
-                            should_continue = True
                             if (
                                 "FOCUS_TARGET_NOT_OBSERVED_YET" in reason_codes
                                 and is_focus_head
@@ -440,28 +511,32 @@ def eval(args, task_num, logger):
                                     logger.info(
                                         f"[SRM Buffer] Dropped focus action (no teleport remaining): '{deferred_action}'"
                                     )
+                                if not action_buffer:
+                                    buffer_owner = None
                             else:
                                 if is_focus_head and ("FOCUS_LIMIT_EXCEEDED" in reason_codes or "FOCUS_LIMIT_REACHED" in reason_codes):
                                     buffer_len_after = len(action_buffer) - 1 if len(action_buffer) > 0 else 0
                                     logger.info(
                                         f"[SRM Buffer] Dropped focus action due to FOCUS_LIMIT_EXCEEDED; buffer_len now = {buffer_len_after}"
                                     )
-                                if (not is_focus_head) and reason_codes == ["NOT_IN_VALID_ACTIONS"]:
-                                    should_continue = False  # Allow baseline trial execution fallback below.
-                                else:
-                                    action_buffer.pop(0)
-                                    if obs_buffer:
-                                        obs_buffer.pop(0)
-                            if should_continue:
-                                continue
+                                action_buffer.pop(0)
+                                if obs_buffer:
+                                    obs_buffer.pop(0)
+                                if not action_buffer:
+                                    buffer_owner = None
+                            continue
                         if gate_decision.kind in ("REPAIR", "ACCEPT") and gate_decision.action_env:
                             action_candidate = gate_decision.action_env
 
                     if action_candidate in validActions:
                         action = action_candidate
+                        action_source = "buffer"
+                        executed_buffer_owner = current_buffer_owner
                         action_buffer.pop(0)
                         if obs_buffer:
                             obs_buffer.pop(0)
+                        if not action_buffer:
+                            buffer_owner = None
                         picked_from_buffer = True
                         break
 
@@ -475,7 +550,7 @@ def eval(args, task_num, logger):
                         if srm_gate is not None:
                             gate_state_v2 = {
                                 "look": info["look"],
-                                "inventory": str(info.get("inv", "")),
+                                "inventory": str(env.inventory()),
                                 "current_room": current_place,
                                 "valid_actions": list(validActions),
                                 "task_description": task_description,
@@ -484,11 +559,12 @@ def eval(args, task_num, logger):
                                 "focus_used": focus_used,
                             }
                             gate_decision_v2 = srm_gate.pre_execute(action_candidate_v2, source="SAGE_BUFFER", state=gate_state_v2)
-                            logger.info(
-                                f"[SRM Gate] src=SAGE_BUFFER raw='{action_candidate_v2}' "
-                                f"norm='{gate_decision_v2.normalized_action}' decision={gate_decision_v2.kind} "
-                                f"reasons={gate_decision_v2.reason_codes}"
-                            )
+                            if gate_decision_v2.kind != "ACCEPT" or (gate_decision_v2.reason_codes or []):
+                                logger.info(
+                                    f"[SRM Gate] src=SAGE_BUFFER raw='{action_candidate_v2}' "
+                                    f"norm='{gate_decision_v2.normalized_action}' decision={gate_decision_v2.kind} "
+                                    f"reasons={gate_decision_v2.reason_codes}"
+                                )
                             if gate_decision_v2.kind != "DROP_INVALID" and gate_decision_v2.action_env:
                                 action_candidate_v2 = gate_decision_v2.action_env
                             elif gate_decision_v2.kind == "DROP_INVALID":
@@ -496,58 +572,14 @@ def eval(args, task_num, logger):
 
                         if action_candidate_v2 and action_candidate_v2 in validActions:
                             action = action_candidate_v2
+                            action_source = "buffer"
+                            executed_buffer_owner = current_buffer_owner
                             action_buffer.pop(0)
                             if obs_buffer:
                                 obs_buffer.pop(0)
+                            if not action_buffer:
+                                buffer_owner = None
                             picked_from_buffer = True
-                            break
-
-                    # Baseline-compatible trial execution fallback for non-focus actions not in validActions.
-                    parsed_candidate = parse_action(normalize_action_text(action_candidate_raw))
-                    is_focus_candidate = parsed_candidate is not None and parsed_candidate.verb == "focus"
-                    allow_trial_fallback = (
-                        (not is_focus_candidate)
-                        and (
-                            (srm_gate is not None and gate_decision.kind == "DROP_INVALID" and (gate_decision.reason_codes or []) == ["NOT_IN_VALID_ACTIONS"])
-                            or (action_candidate not in validActions)
-                        )
-                    )
-
-                    if allow_trial_fallback:
-                        trial_candidates = [action_candidate]
-                        if action_candidate_v2 and action_candidate_v2 != action_candidate:
-                            trial_candidates.append(action_candidate_v2)
-                        trial_candidates = [c for c in trial_candidates if c]
-                        trial_candidates.sort(key=len, reverse=True)
-
-                        trial_succeeded = False
-                        for cand in trial_candidates:
-                            if failed_action_trial[cand] >= 3:
-                                logger.info(f"[BufferTrial] Dropped after 3 failures: '{cand}'")
-                                continue
-                            logger.info(f"[BufferTrial] Trying to execute '{cand}' (not in validActions)")
-                            obs_trial, reward_trial, done_trial, info_trial = env.step(cand)
-                            if obs_trial.startswith("Ambiguous request"):
-                                obs_trial, reward_trial, done_trial, info_trial = env.step("0")
-                            if not is_action_failed(obs_trial):
-                                logger.info(f"[BufferTrial] Success: '{cand}' -> {obs_trial}")
-                                executed = True
-                                action = cand
-                                obs = obs_trial
-                                reward_env = reward_trial
-                                done = done_trial
-                                info = info_trial
-                                action_buffer.pop(0)
-                                if obs_buffer:
-                                    obs_buffer.pop(0)
-                                picked_from_buffer = True
-                                action_source = "buffer"
-                                trial_succeeded = True
-                                break
-                            else:
-                                logger.info(f"[BufferTrial] Failed: '{cand}' -> {obs_trial}")
-                                failed_action_trial[cand] += 1
-                        if trial_succeeded:
                             break
 
                     # Head cannot execute now; drop it and try next head in this same step.
@@ -555,6 +587,8 @@ def eval(args, task_num, logger):
                     action_buffer.pop(0)
                     if obs_buffer:
                         obs_buffer.pop(0)
+                    if not action_buffer:
+                        buffer_owner = None
                     
             # Reset Swift failure counter if action came from buffer (breaks consecutive Swift failure streak)
             if picked_from_buffer:
@@ -562,6 +596,134 @@ def eval(args, task_num, logger):
                 logger.info("[T1 Counter] Reset swift_failure_count=0 because action came from action_buffer.")
 
             if action is None: 
+                # Buffer-drain boundary: if a stagnation-triggered critic request is pending,
+                # give it one chance before returning to Swift/Sage.
+                if enable_srm and action_buffer == [] and pending_critic_report is not None:
+                    pending_age = step - pending_critic_step
+                    if pending_age <= 2:
+                        cooldown_ok = (step - last_critic_step) >= CRITIC_COOLDOWN_STEPS and step >= disable_critic_until_step
+                        calls_ok = critic_calls < MAX_CRITIC_CALLS_PER_EPISODE
+                        if cooldown_ok and calls_ok:
+                            logger.info(
+                                f"[SRM Critic] RUN_AFTER_BUFFER_DRAIN step={step} pending_age={pending_age} "
+                                f"reasons={pending_critic_report.reasons} buffer_owner={buffer_owner} buffer_len={len(action_buffer)}"
+                            )
+                            valid_actions_now = getFilteredValidActions(env, info["look"], task_id=task_num, task_desc=task_description)
+                            valid_actions_list_all = sorted(list(valid_actions_now)) if isinstance(valid_actions_now, set) else list(valid_actions_now)
+                            valid_actions_list_for_critic, removed_counts = filter_valid_actions_for_critic_with_stats(
+                                valid_actions=valid_actions_list_all,
+                                task_description=task_description,
+                                look=info["look"],
+                                inventory=str(info.get("inv", "")),
+                                rooms=rooms,
+                            )
+                            if not valid_actions_list_for_critic and valid_actions_list_all:
+                                valid_actions_list_for_critic = valid_actions_list_all
+                                removed_counts = dict(removed_counts or {})
+                                removed_counts["FILTER_EMPTY_FALLBACK"] = 1
+                            removed_top = sorted((removed_counts or {}).items(), key=lambda x: (-x[1], x[0]))[:5]
+                            logger.info(
+                                f"[SRM Critic] valid_actions_filter: all={len(valid_actions_list_all)} "
+                                f"kept={len(valid_actions_list_for_critic)} removed={len(valid_actions_list_all)-len(valid_actions_list_for_critic)} "
+                                f"removed_top={removed_top}"
+                            )
+                            history_lines = []
+                            hist_n = min(9, len(recent_actions))
+                            for i in range(len(recent_actions) - hist_n, len(recent_actions)):
+                                room_i = recent_locs[i] if i < len(recent_locs) else ""
+                                act_i = recent_actions[i] if i < len(recent_actions) else ""
+                                obs_i = recent_obs[i] if i < len(recent_obs) else ""
+                                history_lines.append(
+                                    f"room={room_i} | action={act_i} | obs={sanitizeStr(str(obs_i))[:160]}"
+                                )
+                            history_lines.append(f"room={current_place} | action={action} | obs={sanitizeStr(obs)[:160]}")
+                            inventory_now = str(env.inventory())
+                            prompt = build_critic_prompt(
+                                task_description=task_description,
+                                stagnation_reasons=pending_critic_report.reasons,
+                                stagnation_metrics=pending_critic_report.metrics,
+                                current_room=current_place,
+                                look=info["look"],
+                                inventory=inventory_now,
+                                recent_history_lines=history_lines,
+                                valid_actions=valid_actions_list_for_critic,
+                                focus_used=focus_used,
+                                focus_limit=focus_limit,
+                            )
+                            logger.info(
+                                f"[SRM Critic] prompt_meta: valid_actions_n={len(valid_actions_list_for_critic)}, "
+                                f"history_n={len(history_lines)}, inv_chars={len(inventory_now)}, look_chars={len(info['look'])}"
+                            )
+                            critic_response = run_critic_once(llm, prompt, logger=logger.info)
+                            logger.info(f"[SRM Critic] response_len={len(critic_response or '')} response='{critic_response}'")
+                            logger.info(f"[SRM Critic] raw_response:\n{critic_response}")
+                            parsed_actions = parse_critic_actions(critic_response, valid_actions=valid_actions_list_for_critic)
+                            logger.info(f"[SRM Critic] parsed_actions(k={len(parsed_actions)}): {parsed_actions}")
+
+                            state_sig = _critic_state_sig(current_place, inventory_now, obs)
+                            actions_hash = _critic_actions_hash(parsed_actions)
+                            recent_3_norm = {
+                                normalize_action_text(a or "").strip().lower()
+                                for a in (recent_actions[-3:] + [action])
+                                if a
+                            }
+                            parsed_norm = [normalize_action_text(a or "").strip().lower() for a in parsed_actions if a]
+                            all_duplicates_recent = bool(parsed_norm) and all(a in recent_3_norm for a in parsed_norm)
+                            nav_only = bool(parsed_norm) and all(
+                                a.startswith("go to ") or a.startswith("teleport to ") or a.startswith("open door to ")
+                                for a in parsed_norm
+                            )
+
+                            skip_reason = None
+                            if not parsed_actions:
+                                skip_reason = "EMPTY_OUTPUT"
+                            elif all_duplicates_recent or nav_only:
+                                skip_reason = "LOW_QUALITY_OUTPUT"
+                            elif state_sig == last_critic_state_sig and actions_hash == last_critic_actions_hash:
+                                skip_reason = "SAME_STATE_SAME_ACTIONS"
+
+                            pending_critic_report = None
+                            pending_critic_step = -1
+                            if skip_reason is not None:
+                                logger.info(f"[SRM Critic] SKIP reason={skip_reason}")
+                                logger.info(f"[SRM Critic] CLEAR_PENDING reason={skip_reason}")
+                                if skip_reason == "SAME_STATE_SAME_ACTIONS":
+                                    disable_critic_until_step = max(disable_critic_until_step, step + CRITIC_BACKOFF_STEPS)
+                            else:
+                                action_buffer = parsed_actions
+                                obs_buffer = ["None"] * len(parsed_actions)
+                                buffer_owner = "critic"
+                                critic_calls += 1
+                                last_critic_step = step
+                                last_critic_state_sig = state_sig
+                                last_critic_actions_hash = actions_hash
+                                logger.info(
+                                    f"[SRM Critic] injected_into_buffer: added={len(parsed_actions)} new_buffer_len={len(action_buffer)}"
+                                )
+                                logger.info("[SRM Critic] CLEAR_PENDING reason=RUN_AFTER_BUFFER_DRAIN")
+                                continue
+                        else:
+                            if not calls_ok:
+                                logger.info("[SRM Critic] SKIP reason=MAX_CALLS")
+                            elif not cooldown_ok:
+                                logger.info("[SRM Critic] SKIP reason=COOLDOWN")
+                    else:
+                        logger.info(
+                            f"[SRM Critic] CLEAR_PENDING reason=STALE_PENDING pending_age={pending_age}"
+                        )
+                        pending_critic_report = None
+                        pending_critic_step = -1
+
+                if action_buffer:
+                    if enable_srm:
+                        logger.info(
+                            f"[SRM Buffer] CLEAR reason=BUFFER_NOT_USEFUL remaining_len={len(action_buffer)} owner={buffer_owner}"
+                        )
+                    action_buffer = []
+                    obs_buffer = []
+                    buffer_owner = None
+                elif buffer_owner is not None:
+                    buffer_owner = None
                 logger.info("Buffer is not useful. Switch to Fast Agent.")
                 input_str = ""
 
@@ -617,6 +779,12 @@ def eval(args, task_num, logger):
                     if step < disable_system2_until_step:
                         force_system_2 = False
                         force_system_2_reason = None
+                    if enable_srm and force_system2_once_reason == "gate_drop_loop":
+                        force_system_1 = False
+                        force_system_2 = True
+                        force_system_2_reason = "gate_drop_loop"
+                        force_system2_once_reason = None
+                        logger.info(f"[SRM LoopBreak] forcing System2 reason=gate_drop_loop step={step}")
                     # === BASELINE SWIFT PATH (when slow_agent=False) ===
                     if not args.get("slow_agent", False):
                         # Baseline Swift-only mode: no Sage, no AMM retrieval
@@ -641,7 +809,7 @@ def eval(args, task_num, logger):
                     # === ARCHITECTURE PATH (when slow_agent=True, Sage always available) ===
                     else:
                         # Use Sage agent (define use_memory_planning here for both Swift and Sage)
-                        use_memory_planning = args.get("use_memory_planning", True) and use_amm
+                        use_memory_planning = args.get("use_memory_planning", True) and enable_amm and (not amm_write_only)
 
                         # Determine if we should run Swift this step
                         # Run Swift if NOT forcing System 2, OR if forcing System 1
@@ -660,7 +828,7 @@ def eval(args, task_num, logger):
                     
                         # Always call findValidActionWithSystem2 (it handles both Swift and Sage paths)
                         # This ensures found_valid_in_top is always defined
-                        cycles_without_progress_val = wm.cycles_without_progress if (use_amm and wm is not None) else 0
+                        cycles_without_progress_val = wm.cycles_without_progress if (enable_amm and wm is not None) else 0
                     if sage_calls_this_env_step >= MAX_SAGE_CALLS_PER_ENV_STEP:
                         fallback_action = deterministic_fallback_action(validActions, current_place)
                         logger.info(
@@ -680,14 +848,16 @@ def eval(args, task_num, logger):
                             gpt_version, llm=llm,
                             episodic_memories=None,  # AMM will handle memory retrieval in Phase 2
                             use_memory_planning=use_memory_planning,
-                                amm_client=amm_client if use_amm else None,  # Pass AMM client only if enabled
+                            # In WRITE_ONLY mode, disable retrieval paths inside findValidActionWithSystem2
+                            # by passing amm_client=None while keeping local AMM client for post-step writes.
+                            amm_client=amm_client if amm_retrieval_enabled else None,
                             current_score=score,  # Current score for retrieval query
                             recent_scores=recent_scores,  # Recent scores for retrieval query
                             swift_failure_count=swift_failure_count,  # Pass swift_failure_count for T1 escalation
                                 cycles_without_progress=cycles_without_progress_val,  # Pass cycles_without_progress for T2 escalation
                                 force_system_2_reason=force_system_2_reason,  # Pass reason for forcing System 2 (to bypass T1 if focus_gate)
                             # Parameters for second Swift pass (T1-S2 retry)
-                            args={**(args or {}), "srm_no_reward_streak": srm_no_reward_streak},
+                            args=args,
                             tokenizer=tokenizer,
                             lm_model=lm_model,
                             device=device,
@@ -759,7 +929,7 @@ def eval(args, task_num, logger):
                             last_sage_state_sig = sage_state_sig
                         action_buffer = return_result[0] # reset the buffer 
                         obs_buffer = return_result[1]
-                        failed_action_trial = defaultdict(lambda: 0)
+                        buffer_owner = "sage" if action_buffer else None
                         failed_messages = [] # reset the failed messages 
                         logger.info(f"action_buffer reset by the Slow Agent") 
                         last_time_system2 = step  
@@ -835,10 +1005,16 @@ def eval(args, task_num, logger):
                     continue 
             
             # SRM Gate-1 (Milestone-1): final pre-execution validation for Swift/Buffer/Sage-produced action
-            if action is not None and not executed and srm_gate is not None and action_source != "buffer":
+            if action is not None and not executed and srm_gate is not None and not (action_source or "").startswith("buffer"):
+                action_before_gate = action
+                action = try_to_replace(action, validActions, info["look"], info.get("inv", env.inventory()))
+                if action_before_gate != action:
+                    logger.info(
+                        f"[SRM PreGateRepair] src={(action_source or 'swift').upper()} '{action_before_gate}' -> '{action}'"
+                    )
                 gate_state_final = {
                     "look": info["look"],
-                    "inventory": str(info.get("inv", "")),
+                    "inventory": str(env.inventory()),
                     "current_room": current_place,
                     "valid_actions": list(validActions),
                     "task_description": task_description,
@@ -851,11 +1027,13 @@ def eval(args, task_num, logger):
                     source=(action_source or "swift").upper(),
                     state=gate_state_final,
                 )
-                logger.info(
-                    f"[SRM Gate] src={(action_source or 'swift').upper()} raw='{action}' "
-                    f"norm='{gate_decision_final.normalized_action}' decision={gate_decision_final.kind} "
-                    f"reasons={gate_decision_final.reason_codes}"
-                )
+                log_swift_gate = (action_source or "swift") == "swift"
+                if log_swift_gate or gate_decision_final.kind != "ACCEPT" or (gate_decision_final.reason_codes or []):
+                    logger.info(
+                        f"[SRM Gate] src={(action_source or 'swift').upper()} raw='{action}' "
+                        f"norm='{gate_decision_final.normalized_action}' decision={gate_decision_final.kind} "
+                        f"reasons={gate_decision_final.reason_codes}"
+                    )
                 if "FOCUS_LIMIT_EXCEEDED" in (gate_decision_final.reason_codes or []) or "FOCUS_LIMIT_REACHED" in (gate_decision_final.reason_codes or []):
                     logger.info(
                         f"[FOCUS_LIMIT] task={task_num} used={focus_used}/{focus_limit} "
@@ -864,72 +1042,68 @@ def eval(args, task_num, logger):
                 if gate_decision_final.kind in ("REPAIR", "ACCEPT") and gate_decision_final.action_env:
                     action = gate_decision_final.action_env
                 elif gate_decision_final.kind == "DROP_INVALID":
-                    failed_messages.append(
-                        f"\t\t Failed action: (in {current_place}) [{action}] --> GATE_INVALID:{','.join(gate_decision_final.reason_codes)}"
+                    if gate_drop_step != step:
+                        gate_drop_step = step
+                        gate_drop_streak = 0
+                    gate_drop_streak += 1
+                    logger.info(
+                        f"[SRM LoopBreak] gate_drop step={step} streak={gate_drop_streak} "
+                        f"action='{action}' reasons={gate_decision_final.reason_codes}"
                     )
-                    dropped_by_gate_this_step += 1
-                    logger.info("[SRM Gate] Action dropped before env.step; attempting same-step recovery.")
+                    if action_source == "swift":
+                        swift_failure_count += 1
+                        logger.info("[T1 Counter] gate_drop_no_step -> increment (reason=gate_drop)")
+                        failed_messages.append(
+                            f"\t\t Failed action: (in {current_place}) [{action}] --> GATE_INVALID:{','.join(gate_decision_final.reason_codes)}"
+                        )
+                    if gate_drop_streak >= 2:
+                        can_force_system2 = args.get("slow_agent", False) and sage_calls_this_env_step < MAX_SAGE_CALLS_PER_ENV_STEP
+                        if can_force_system2:
+                            force_system2_once_reason = "gate_drop_loop"
+                            logger.info(f"[SRM LoopBreak] forcing System2 reason=gate_drop_loop step={step}")
+                            # Top-1 only: if gate rejects, do not try Top-2+ in this step.
+                            logger.info("[SRM Gate] Action dropped/skipped before env.step.")
+                            continue
 
-                    recovered_action = None
-                    recovered_source = action_source
+                        fallback_candidates = []
+                        for cand in ("look around", "inventory", "wait"):
+                            if cand in validActions:
+                                fallback_candidates.append(cand)
+                        if not fallback_candidates:
+                            fallback_pick = deterministic_fallback_action(validActions, current_place)
+                            if fallback_pick:
+                                fallback_candidates.append(fallback_pick)
 
-                    # Same-step Sage recovery on first gate drop, if Sage cap allows it.
-                    if dropped_by_gate_this_step >= 1 and args.get("slow_agent", False) and sage_calls_this_env_step < MAX_SAGE_CALLS_PER_ENV_STEP:
-                        try:
-                            used_sys2_drop, return_result_drop, found_valid_drop, source_drop = findValidActionWithSystem2(
-                                [], env, task_num, task_description, info['look'],
-                                recent_actions, recent_reward, recent_obs, recent_locs, recent_looks, failed_messages,
-                                demo_data, logger, sbert_model, step, last_time_system2_steps,
-                                useful_focus_on, focus_on_done, False, True,
-                                gpt_version, llm=llm,
-                                episodic_memories=None,
-                                use_memory_planning=(args.get("use_memory_planning", True) and use_amm),
-                                amm_client=amm_client if use_amm else None,
-                                current_score=score,
-                                recent_scores=recent_scores,
-                                swift_failure_count=swift_failure_count,
-                                cycles_without_progress=(wm.cycles_without_progress if (use_amm and wm is not None) else 0),
-                                force_system_2_reason="srm_drop",
-                                args={**(args or {}), "srm_no_reward_streak": srm_no_reward_streak},
-                                tokenizer=tokenizer,
-                                lm_model=lm_model,
-                                device=device,
-                                compose_instance=compose_instance,
-                                prev_action=prev_action,
-                                prev_obs=prev_obs,
-                                objects=objects,
-                                places=places,
-                                srm_gate=srm_gate
+                        fallback_exec = None
+                        for cand in fallback_candidates:
+                            cand_decision = srm_gate.pre_execute(
+                                cand,
+                                source="LOOPBREAK_FALLBACK",
+                                state=gate_state_final,
                             )
-                            if used_sys2_drop:
-                                sage_calls_this_env_step += 1
-                                action_buffer = return_result_drop[0]
-                                obs_buffer = return_result_drop[1]
-                                failed_action_trial = defaultdict(lambda: 0)
-                                logger.info("action_buffer reset by the Slow Agent (srm_drop recovery)")
-                            else:
-                                recovered_action = return_result_drop
-                                recovered_source = source_drop if source_drop else "swift"
-                        except Exception as e:
-                            logger.info(f"[SRM Gate] same-step Sage recovery failed: {e}")
+                            if cand_decision.kind in ("REPAIR", "ACCEPT") and cand_decision.action_env:
+                                fallback_exec = cand_decision.action_env
+                                break
 
-                    # If no direct recovered action, force deterministic fallback to guarantee progress.
-                    if recovered_action is None:
-                        recovered_action = deterministic_fallback_action(validActions, current_place)
-                        recovered_source = "swift"
-                        logger.info(f"[SRM Gate] same-step fallback action='{recovered_action}'")
-
-                    if recovered_action is None:
-                        logger.info("[SRM Gate] No recovery action found; skipping step to avoid crash.")
+                        if fallback_exec is not None:
+                            action = fallback_exec
+                            action_source = "loopbreak_fallback"
+                            logger.info(f"[SRM LoopBreak] fallback_exec action='{action}' step={step}")
+                        else:
+                            logger.info("[SRM Gate] Action dropped/skipped before env.step.")
+                            continue
+                    else:
+                        # Top-1 only: if gate rejects, do not try Top-2+ in this step.
+                        logger.info("[SRM Gate] Action dropped/skipped before env.step.")
                         continue
-
-                    action = recovered_action
-                    action_source = recovered_source
             
             # If the action was not already executed in the previous loop, execute it
             if not executed:
                 obs, reward_env, done, info = env.step(action)
-                if (action or "").lower().startswith("focus on "):
+                if enable_srm:
+                    gate_drop_streak = 0
+                    gate_drop_step = -1
+                if enable_srm and (action or "").lower().startswith("focus on "):
                     focus_used += 1
                     logger.info(
                         f"[FOCUS_LIMIT] task={task_num} used={focus_used}/{focus_limit} "
@@ -937,14 +1111,18 @@ def eval(args, task_num, logger):
                     )
                 # Log env step ground truth
                 current_place_after_step = get_current_room(info['look'])
-                logger.info(f"[ENV_STEP] source={action_source or 'unknown'} executed_from_buffer=False action='{action}' reward={reward_env} score={info['score']} done={done} room={current_place_after_step} obs={obs[:160]}")
+                executed_from_buffer = bool((action_source or "").startswith("buffer"))
+                source_for_log = action_source or "unknown"
+                if executed_from_buffer:
+                    source_for_log = f"buffer(owner={executed_buffer_owner or 'unknown'})"
+                logger.info(f"[ENV_STEP] source={source_for_log} executed_from_buffer={executed_from_buffer} action='{action}' reward={reward_env} score={info['score']} done={done} room={current_place_after_step} obs={obs[:160]}")
             
             # Handle ambiguous requests (resolve by choosing "0")
             if obs.startswith("Ambiguous request"):
                 if srm_gate is not None:
                     gate_state_amb2 = {
                         "look": info["look"],
-                        "inventory": str(info.get("inv", "")),
+                        "inventory": str(env.inventory()),
                         "current_room": current_place,
                         "valid_actions": list(validActions),
                         "task_description": task_description,
@@ -952,11 +1130,12 @@ def eval(args, task_num, logger):
                         "focus_used": focus_used,
                     }
                     gate_decision_amb2 = srm_gate.pre_execute("0", source=(action_source or "swift").upper(), state=gate_state_amb2)
-                    logger.info(
-                        f"[SRM Gate] src={(action_source or 'swift').upper()} raw='0' "
-                        f"norm='{gate_decision_amb2.normalized_action}' decision={gate_decision_amb2.kind} "
-                        f"reasons={gate_decision_amb2.reason_codes}"
-                    )
+                    if gate_decision_amb2.kind != "ACCEPT" or (gate_decision_amb2.reason_codes or []):
+                        logger.info(
+                            f"[SRM Gate] src={(action_source or 'swift').upper()} raw='0' "
+                            f"norm='{gate_decision_amb2.normalized_action}' decision={gate_decision_amb2.kind} "
+                            f"reasons={gate_decision_amb2.reason_codes}"
+                        )
                     if gate_decision_amb2.kind in ("REPAIR", "ACCEPT") and gate_decision_amb2.action_env:
                         obs, reward_env, done, info = env.step(gate_decision_amb2.action_env)
                     else:
@@ -965,7 +1144,10 @@ def eval(args, task_num, logger):
                     obs, reward_env, done, info = env.step("0")
                 # Log ambiguous resolution step
                 current_place_after_resolve = get_current_room(info['look'])
-                logger.info(f"[ENV_STEP] source={action_source or 'unknown'} executed_from_buffer=False action='0' reward={reward_env} score={info['score']} done={done} room={current_place_after_resolve} obs={obs[:160]}")
+                source_for_log = action_source or "unknown"
+                if (action_source or "").startswith("buffer"):
+                    source_for_log = f"buffer(owner={executed_buffer_owner or 'unknown'})"
+                logger.info(f"[ENV_STEP] source={source_for_log} executed_from_buffer=False action='0' reward={reward_env} score={info['score']} done={done} room={current_place_after_resolve} obs={obs[:160]}")
             
             # Capture TRUE values from environment immediately after step
             # Reward is 0 if score doesn't increase (no negative rewards)
@@ -982,19 +1164,142 @@ def eval(args, task_num, logger):
             
             # Update current place after step (may have changed)
             current_place = get_current_room(info['look'])
+            if enable_srm and stagnation_detector is not None:
+                stagnation_report = stagnation_detector.update(
+                    step=step,
+                    action=action,
+                    obs=obs,
+                    room=current_place,
+                    inventory_text=env.inventory(),
+                    score=score_true,
+                )
+                if stagnation_report is not None and stagnation_report.is_stagnated:
+                    logger.info(
+                        f"[SRM Stagnation] step={step} reasons={stagnation_report.reasons} "
+                        f"room={current_place} score={score_true} "
+                        f"action='{stagnation_report.last_action}' "
+                        f"metrics={stagnation_report.metrics} "
+                        f"obs_sig='{stagnation_report.last_obs_sig}'"
+                    )
+                    buffer_busy = bool(action_buffer) or (buffer_owner is not None)
+                    if buffer_busy:
+                        pending_critic_report = stagnation_report
+                        pending_critic_step = step
+                        logger.info(
+                            f"[SRM Critic] PENDING step={step} reasons={stagnation_report.reasons} "
+                            f"buffer_owner={buffer_owner} buffer_len={len(action_buffer)}"
+                        )
+                    else:
+                        cooldown_ok = (step - last_critic_step) >= CRITIC_COOLDOWN_STEPS and step >= disable_critic_until_step
+                        calls_ok = critic_calls < MAX_CRITIC_CALLS_PER_EPISODE
+                        if cooldown_ok and calls_ok:
+                            logger.info(
+                                f"[SRM Critic] TRIGGER step={step} reasons={stagnation_report.reasons} "
+                                f"room={current_place} score={score_true} cooldown_ok={cooldown_ok} calls={critic_calls}"
+                            )
+                            valid_actions_now = getFilteredValidActions(env, info["look"], task_id=task_num, task_desc=task_description)
+                            valid_actions_list_all = sorted(list(valid_actions_now)) if isinstance(valid_actions_now, set) else list(valid_actions_now)
+                            valid_actions_list_for_critic, removed_counts = filter_valid_actions_for_critic_with_stats(
+                                valid_actions=valid_actions_list_all,
+                                task_description=task_description,
+                                look=info["look"],
+                                inventory=str(info.get("inv", "")),
+                                rooms=rooms,
+                            )
+                            if not valid_actions_list_for_critic and valid_actions_list_all:
+                                valid_actions_list_for_critic = valid_actions_list_all
+                                removed_counts = dict(removed_counts or {})
+                                removed_counts["FILTER_EMPTY_FALLBACK"] = 1
+                            removed_top = sorted((removed_counts or {}).items(), key=lambda x: (-x[1], x[0]))[:5]
+                            logger.info(
+                                f"[SRM Critic] valid_actions_filter: all={len(valid_actions_list_all)} "
+                                f"kept={len(valid_actions_list_for_critic)} removed={len(valid_actions_list_all)-len(valid_actions_list_for_critic)} "
+                                f"removed_top={removed_top}"
+                            )
+                            history_lines = []
+                            hist_n = min(9, len(recent_actions))
+                            for i in range(len(recent_actions) - hist_n, len(recent_actions)):
+                                room_i = recent_locs[i] if i < len(recent_locs) else ""
+                                act_i = recent_actions[i] if i < len(recent_actions) else ""
+                                obs_i = recent_obs[i] if i < len(recent_obs) else ""
+                                history_lines.append(
+                                    f"room={room_i} | action={act_i} | obs={sanitizeStr(str(obs_i))[:160]}"
+                                )
+                            history_lines.append(f"room={current_place} | action={action} | obs={sanitizeStr(obs)[:160]}")
+                            inventory_now = str(env.inventory())
+                            prompt = build_critic_prompt(
+                                task_description=task_description,
+                                stagnation_reasons=stagnation_report.reasons,
+                                stagnation_metrics=stagnation_report.metrics,
+                                current_room=current_place,
+                                look=info["look"],
+                                inventory=inventory_now,
+                                recent_history_lines=history_lines,
+                                valid_actions=valid_actions_list_for_critic,
+                                focus_used=focus_used,
+                                focus_limit=focus_limit,
+                            )
+                            logger.info(
+                                f"[SRM Critic] prompt_meta: valid_actions_n={len(valid_actions_list_for_critic)}, "
+                                f"history_n={len(history_lines)}, inv_chars={len(inventory_now)}, look_chars={len(info['look'])}"
+                            )
+                            critic_response = run_critic_once(llm, prompt, logger=logger.info)
+                            logger.info(f"[SRM Critic] response_len={len(critic_response or '')} response='{critic_response}'")
+                            logger.info(f"[SRM Critic] raw_response:\n{critic_response}")
+                            parsed_actions = parse_critic_actions(critic_response, valid_actions=valid_actions_list_for_critic)
+                            logger.info(f"[SRM Critic] parsed_actions(k={len(parsed_actions)}): {parsed_actions}")
+
+                            state_sig = _critic_state_sig(current_place, inventory_now, obs)
+                            actions_hash = _critic_actions_hash(parsed_actions)
+                            recent_3_norm = {
+                                normalize_action_text(a or "").strip().lower()
+                                for a in (recent_actions[-3:] + [action])
+                                if a
+                            }
+                            parsed_norm = [normalize_action_text(a or "").strip().lower() for a in parsed_actions if a]
+                            all_duplicates_recent = bool(parsed_norm) and all(a in recent_3_norm for a in parsed_norm)
+                            nav_only = bool(parsed_norm) and all(
+                                a.startswith("go to ") or a.startswith("teleport to ") or a.startswith("open door to ")
+                                for a in parsed_norm
+                            )
+
+                            skip_reason = None
+                            if not parsed_actions:
+                                skip_reason = "EMPTY_OUTPUT"
+                            elif all_duplicates_recent or nav_only:
+                                skip_reason = "LOW_QUALITY_OUTPUT"
+                            elif state_sig == last_critic_state_sig and actions_hash == last_critic_actions_hash:
+                                skip_reason = "SAME_STATE_SAME_ACTIONS"
+
+                            if skip_reason is not None:
+                                logger.info(f"[SRM Critic] SKIP reason={skip_reason}")
+                                if skip_reason == "SAME_STATE_SAME_ACTIONS":
+                                    disable_critic_until_step = max(disable_critic_until_step, step + CRITIC_BACKOFF_STEPS)
+                            else:
+                                action_buffer = parsed_actions
+                                obs_buffer = ["None"] * len(parsed_actions)
+                                buffer_owner = "critic"
+                                critic_calls += 1
+                                last_critic_step = step
+                                last_critic_state_sig = state_sig
+                                last_critic_actions_hash = actions_hash
+                                logger.info(
+                                    f"[SRM Critic] injected_into_buffer: added={len(parsed_actions)} new_buffer_len={len(action_buffer)}"
+                                )
+                        else:
+                            if not calls_ok:
+                                logger.info("[SRM Critic] SKIP reason=MAX_CALLS")
+                            elif not cooldown_ok:
+                                logger.info("[SRM Critic] SKIP reason=COOLDOWN")
             
             # Update tracking lists with TRUE values
             no_action_done = 0
             prev_action = action
-            
-            # Track SRM no-reward streak
-            if action_source == "srm":
-                if reward_true == 0:
-                    srm_no_reward_streak += 1
-                else:
-                    srm_no_reward_streak = 0  # Reset on any reward
-            elif action_source != "srm":
-                srm_no_reward_streak = 0  # Reset if not SRM action
+
+            if enable_srm and reward_true > 0 and pending_critic_report is not None:
+                logger.info(f"[SRM Critic] CLEAR_PENDING reason=PROGRESS reward={reward_true}")
+                pending_critic_report = None
+                pending_critic_step = -1
 
             # Shared stuck detector state (baseline/SRM/AMM fairness)
             no_reward_streak = (no_reward_streak + 1) if reward_true <= 0 else 0
@@ -1027,7 +1332,6 @@ def eval(args, task_num, logger):
                 )
                 action_buffer = []
                 obs_buffer = []
-                failed_action_trial = defaultdict(lambda: 0)
                 disable_system2_until_step = max(disable_system2_until_step, step + SAGE_COOLDOWN_STEPS)
                 same_state_sage_replan_streak = 0
             
@@ -1041,11 +1345,14 @@ def eval(args, task_num, logger):
             recent_locs.append(current_place)
             
             # Log step result
-            logger.info(f"[StepResult] source={action_source or 'unknown'} action={action} reward={reward_true} score={score_true} srm_no_reward_streak={srm_no_reward_streak}")
+            step_source = action_source or "unknown"
+            if (action_source or "").startswith("buffer"):
+                step_source = f"buffer(owner={executed_buffer_owner or 'unknown'})"
+            logger.info(f"[StepResult] source={step_source} action={action} reward={reward_true} score={score_true}")
             
             # === AMM HOOK: POST-STEP WRITE (BEFORE any score modifications) ===
             # Write memory with TRUE reward/score values from environment (only when use_amm=True)
-            if use_amm and amm_client is not None and wm is not None:
+            if enable_amm and amm_client is not None and wm is not None:
                 try:
                     from amm.writer import write_success, write_nearmiss, write_avoidance, create_memory_record
                     from amm.config import DEFAULT_CONFIG
@@ -1140,7 +1447,7 @@ def eval(args, task_num, logger):
             
             # === T3 TRIGGER: Repeated Invalid Action (Retrieval B - Avoidance EMs) ===
             # Only active when use_amm=True
-            if use_amm and amm_client is not None and wm is not None:
+            if enable_amm and amm_retrieval_enabled and amm_client is not None and wm is not None:
                 from amm.config import DEFAULT_CONFIG
                 from amm.retrieval import build_avoidance_retrieval_query_b, retrieve_avoidance_ems_b
                 from amm.formatters import _parse_inventory_text
@@ -1301,11 +1608,13 @@ def parse_args():
     parser.add_argument("--demo_file", default="data_utils/demos.json", type=str)
     parser.add_argument("--debug_var", type=int, default=93)
     parser.add_argument("--use_memory_planning", action="store_true", default=True)
-    parser.add_argument("--use_amm", action="store_true", default=False, help="Enable AMM (Adaptive Memory Module) retrieval and writing. Sage/System 2 is always available when slow_agent=True.")
-    parser.add_argument("--disable_srm", action="store_true", default=False, help="Disable SRM (Self-Reflection Module).")
-    parser.add_argument("--srm_gate_debug", action="store_true", default=False, help="Enable debug logs for SRM Gate-1 validate/repair decisions.")
-    parser.add_argument("--srm_max_candidates", type=int, default=200, help="SRM: Maximum number of action candidates to consider (hard cap for efficiency).")
-    parser.add_argument("--srm_recent_window", type=int, default=5, help="SRM: Number of recent actions to check for scoring.")
+    # Backward-compatible runner aliases (safe no-op/profile flags).
+    parser.add_argument("--baseline", action="store_true", default=False, help=argparse.SUPPRESS)
+    parser.add_argument("--enable-amm", dest="use_amm", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--enable-srm", dest="disable_srm", action="store_false", help=argparse.SUPPRESS)
+    parser.add_argument("--use_amm", "--use-amm", dest="use_amm", action="store_true", default=False, help="Enable AMM (Adaptive Memory Module) retrieval and writing. Sage/System 2 is always available when slow_agent=True.")
+    parser.add_argument("--amm_write_only", "--amm-write-only", dest="amm_write_only", action="store_true", default=False, help="AMM write-only mode: keep writes enabled but disable retrieval and prompt augmentation.")
+    parser.add_argument("--disable_srm", "--disable-srm", dest="disable_srm", action="store_true", default=False, help="Disable SRM (Self-Reflection Module).")
     args = parser.parse_args()
     params = vars(args)
     return params
