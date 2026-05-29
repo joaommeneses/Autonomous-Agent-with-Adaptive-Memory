@@ -110,7 +110,6 @@ class ActionValidator:
             # Exact equality is enforced only when an explicit focus_target is externally set.
             if focus_target and target != _norm_text(focus_target):
                 return ValidationResult(status="INVALID", reason_codes=["FOCUS_WRONG_TARGET"])
-            # Always require target to be observed/actionable in current context.
             if not _is_target_observed(target, look, inventory):
                 return ValidationResult(status="INVALID", reason_codes=["FOCUS_TARGET_NOT_OBSERVED_YET"])
 

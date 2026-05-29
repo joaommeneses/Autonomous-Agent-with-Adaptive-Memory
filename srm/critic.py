@@ -7,6 +7,42 @@ def _norm_action_text(action: str) -> str:
     return re.sub(r"\s+", " ", (action or "").strip().lower())
 
 
+def _extract_recent_actions_to_avoid(recent_history_lines: Sequence[str], k: int = 3) -> List[str]:
+    extracted: List[str] = []
+    for line in recent_history_lines or []:
+        text = str(line or "")
+        action = ""
+        if " | action=" in text:
+            action = text.split(" | action=", 1)[1]
+            if " | obs=" in action:
+                action = action.split(" | obs=", 1)[0]
+        elif "action=" in text:
+            action = text.split("action=", 1)[1]
+            if " | obs=" in action:
+                action = action.split(" | obs=", 1)[0]
+        action = action.strip()
+        if action:
+            extracted.append(action)
+    return extracted[-k:]
+
+
+def _derive_stagnation_mode(stagnation_reasons: Sequence[str]) -> str:
+    reasons_upper = [str(r or "").upper() for r in (stagnation_reasons or [])]
+    has_move_spam = any("MOVE_SPAM" in r for r in reasons_upper)
+    has_repeat_no_effect = any(("REPEAT_ACTION" in r or "REPEAT_VERB" in r) for r in reasons_upper)
+    has_same_obs = any("SAME_OBS" in r for r in reasons_upper)
+    active = int(has_move_spam) + int(has_repeat_no_effect) + int(has_same_obs)
+    if active >= 2:
+        return "mixed_stagnation"
+    if has_move_spam:
+        return "move_spam"
+    if has_repeat_no_effect:
+        return "repeat_no_effect"
+    if has_same_obs:
+        return "same_obs_loop"
+    return "other_stagnation"
+
+
 def _filter_valid_actions_for_critic_internal(
     valid_actions: Sequence[str],
     task_description: str,
@@ -107,9 +143,22 @@ def build_critic_prompt(
     valid_actions: Sequence[str],
     focus_used: int = 0,
     focus_limit: int = 1,
+    episodic_memories_block: Optional[str] = None,
 ) -> str:
     history_block = "\n".join(recent_history_lines[-10:]) if recent_history_lines else "(none)"
-    valid_block = "\n".join(f"- {a}" for a in valid_actions)
+    valid_block = "\n".join(str(a) for a in valid_actions)
+    focus_forbidden = "YES" if focus_used >= focus_limit else "NO"
+    reasons_upper = [str(r or "").upper() for r in (stagnation_reasons or [])]
+    nav_count_5 = int((stagnation_metrics or {}).get("nav_count_5", 0) or 0)
+    nav_disfavored = "YES" if (any("MOVE_SPAM" in r for r in reasons_upper) or nav_count_5 >= 3) else "NO"
+    recent_actions_to_avoid = _extract_recent_actions_to_avoid(recent_history_lines, k=3)
+    stagnation_mode = _derive_stagnation_mode(stagnation_reasons)
+    episodic_section = ""
+    if episodic_memories_block and episodic_memories_block.strip():
+        episodic_section = (
+            "EPISODIC_MEMORIES (non-binding evidence):\n"
+            f"{episodic_memories_block.strip()}\n\n"
+        )
     return f"""You are SRM Critic for a ScienceWorld-style agent.
 You are NOT the Planner. The Planner makes broad plans.
 You are an immediate intervention layer used only when the agent is stagnated.
@@ -139,10 +188,20 @@ RECENT_HISTORY (most recent last):
 FOCUS_USAGE:
 used={focus_used}, limit={focus_limit}
 
-VALID_ACTIONS (EXHAUSTIVE; you MUST copy exact strings from here and MUST NOT invent new actions):
+RUNTIME_CONSTRAINTS:
+FOCUS_ACTIONS_FORBIDDEN={focus_forbidden}
+NAVIGATION_STRONGLY_DISFAVORED={nav_disfavored}
+RECENT_ACTIONS_TO_AVOID={recent_actions_to_avoid}
+STAGNATION_MODE={stagnation_mode}
+
+{episodic_section}VALID_ACTIONS (EXHAUSTIVE; RAW STRINGS, one per line; copy exact strings only):
 {valid_block}
 
 Hard rules (do not break these):
+- Runtime constraints override episodic memories.
+- If FOCUS_ACTIONS_FORBIDDEN=YES: never output any "focus on ..." action.
+- If NAVIGATION_STRONGLY_DISFAVORED=YES: use navigation only when it is the only immediate enabler.
+- Avoid proposing actions in RECENT_ACTIONS_TO_AVOID unless clearly justified as a strict enabler.
 - Your job is to break stagnation with task-aligned progress actions.
 - Every action must directly advance TASK or set up an immediate prerequisite from LOOK/INVENTORY.
 - Use STAGNATION_REASONS to avoid repeating the same failure mode.
@@ -155,6 +214,21 @@ Hard rules (do not break these):
 - If focus_used >= focus_limit: NEVER output any "focus on ..." action.
 - Avoid loops: avoid actions identical to any of the last 3 actions in RECENT_HISTORY unless clearly necessary.
 - Avoid movement spam: output at most 1 navigation action (go/teleport/open door) in your ACTIONS list.
+- Memory-use rules:
+  - Episodic memories are non-binding evidence and may be stale.
+  - Use episodic memories as hints, not commands.
+  - Prefer current LOOK/INVENTORY/VALID_ACTIONS when memory conflicts with current state.
+  - Runtime constraints override memory examples.
+  - Do not copy memory actions unless they are valid now and appear verbatim in VALID_ACTIONS.
+  - If a memory suggests a forbidden action now, infer the nearest admissible prerequisite or alternative.
+  - Prioritize actions that change world state now; deprioritize sensing-only or repeated no-effect actions unless they unlock progress.
+
+Selection procedure (strict order):
+1) Read RUNTIME_CONSTRAINTS first.
+2) Diagnose stagnation mode and immediate blocker.
+3) Use episodic memories only as supporting evidence.
+4) Select exact actions from VALID_ACTIONS.
+5) Re-check final list against VALID_ACTIONS and RUNTIME_CONSTRAINTS.
 
 Output format (STRICT; do not add extra numbered lists outside ACTIONS):
 DIAGNOSIS:
@@ -209,8 +283,6 @@ def parse_critic_actions(response_text: str, valid_actions: Optional[Sequence[st
 
 
 def run_critic_once(llm, prompt: str, logger=None) -> str:
-    # Reuse the exact shared System-2 route (Qwen-vLLM or local wrapper)
-    # so Critic and Sage use the same backend behavior.
     from eval_utils import call_system2
 
     return call_system2(

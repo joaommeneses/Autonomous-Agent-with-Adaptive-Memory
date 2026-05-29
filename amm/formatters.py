@@ -658,7 +658,7 @@ def build_swift_memories_block(
             f"[AMM SwiftMem] ERROR: Swift EM injection called with non-Swift prompt "
             f"(missing final question marker). input_str_len={len(input_str)}, "
             f"trigger_context={trigger_context!r}. Preview: {input_str[:100]}..."
-        )
+    )
         return None
     
     if not episodic_memories:
@@ -713,4 +713,145 @@ def build_swift_memories_block(
     )
     
     return augmented_input_str
+
+
+def build_critic_memories_block(
+    worked_ems: Sequence[Any],
+    avoidance_ems: Sequence[Any],
+    max_worked: int = 3,
+    max_avoid: int = 1,
+    char_cap: int = 12000,
+    current_room: str = "",
+    focus_actions_forbidden: bool = False,
+    current_task: str = "",
+    logger: Optional[Any] = None,
+) -> str:
+    """
+    Build a Sage-style structured episodic-evidence block for SRM Critic.
+    """
+    room_norm = (current_room or "").strip().lower()
+    task_norm = (current_task or "").strip().lower()
+
+    invalid_obs_markers = (
+        "no known action matches",
+        "you can't",
+        "you cannot",
+        "not allowed",
+        "doesn't seem possible",
+        "invalid action",
+    )
+
+    def _extract_struct_fields(em: Any) -> tuple[str, str, str, str, str]:
+        content = get_em_content(em)
+        action = (_parse_field_from_content(content, "ACTION") or "").strip()
+        obs = (_parse_field_from_content(content, "OBSERVATION") or "").strip()
+        reward = (_parse_field_from_content(content, "REWARD") or "").strip()
+        tags = (_parse_field_from_content(content, "TAGS") or "").strip().lower()
+        task = (_parse_field_from_content(content, "TASK") or "").strip().lower()
+        return action, obs, reward, tags, task
+
+    def _reward_value(reward_text: str) -> float:
+        if not reward_text:
+            return 0.0
+        m = re.search(r"([+-]?\d+(?:\.\d+)?)", reward_text)
+        if not m:
+            return 0.0
+        try:
+            return float(m.group(1))
+        except Exception:
+            return 0.0
+
+    def _content_signature(em: Any) -> str:
+        content = get_em_content(em)
+        action, obs, reward, tags, _ = _extract_struct_fields(em)
+        if action or obs or reward or tags:
+            return f"{action.lower()}||{obs.lower()}||{reward.lower()}||{tags.lower()}"
+        return content.strip().lower()
+
+    worked_ranked = []
+    seen_worked = set()
+    for em in list(worked_ems or []):
+        if not is_structured_episodic_memory(em):
+            continue
+        sig = _content_signature(em)
+        if sig in seen_worked:
+            continue
+        seen_worked.add(sig)
+
+        content = get_em_content(em)
+        action, obs, reward_text, tags, task = _extract_struct_fields(em)
+        obs_norm = obs.lower()
+        if any(m in obs_norm for m in invalid_obs_markers):
+            continue
+        if "avoidance" in tags or "invalid_action" in tags or "episodic_failure" in tags:
+            continue
+
+        state_line = ""
+        for line in content.splitlines():
+            if line.strip().startswith("STATE:"):
+                state_line = line.strip()
+                break
+        room, _ = _parse_state_line(state_line)
+        room_match = int(bool(room_norm) and room.strip().lower() == room_norm)
+        task_match = int(bool(task_norm) and task_norm in task)
+        reward_val = _reward_value(reward_text)
+        reward_pos = int(reward_val > 0)
+        success_like = int(
+            ("episodic_success" in tags)
+            or ("milestone" in tags)
+            or ("partial" in tags)
+            or ("episodic_nearmiss" in tags)
+        )
+        focus_penalty = -1 if (focus_actions_forbidden and action.lower().startswith("focus on")) else 0
+        score = (task_match * 1000) + (room_match * 100) + (reward_pos * 10) + success_like + focus_penalty
+        worked_ranked.append((score, reward_val, em))
+
+    worked_ranked.sort(key=lambda x: (-x[0], -x[1]))
+    worked_selected = [em for _, _, em in worked_ranked[:max_worked]]
+
+    avoid_selected = []
+    seen_avoid = set()
+    for em in list(avoidance_ems or []):
+        if not is_structured_episodic_memory(em):
+            continue
+        sig = _content_signature(em)
+        if sig in seen_avoid or sig in seen_worked:
+            continue
+        seen_avoid.add(sig)
+        avoid_selected.append(em)
+        if len(avoid_selected) >= max_avoid:
+            break
+
+    selected = worked_selected + avoid_selected
+    if not selected:
+        return ""
+
+    lines: List[str] = []
+    lines.append("RELEVANT PAST EPISODES (FROM MEMORY)")
+    lines.append("")
+    lines.append("You are given a small set of past episodes retrieved from memory. These may be from similar tasks or similar states.")
+    lines.append("")
+    lines.append("Use them as hints to break the current stagnation more effectively.")
+    lines.append("")
+    lines.append("How to use them:")
+    lines.append("- Extract actionable patterns: useful objects/containers, common successful subgoals, typical mistake-fixes, and critical timing.")
+    lines.append("- Prefer the current observations when there is any conflict.")
+    lines.append("- Do not assume every item mentioned in memory exists in the current run; if missing, propose the closest valid alternative in this environment.")
+    lines.append("- Runtime constraints override memory examples.")
+    lines.append("- Do not copy memory actions unless they are valid now and appear in VALID_ACTIONS.")
+    lines.append("")
+
+    for i, em in enumerate(selected, 1):
+        lines.append(f"[Memory Episode {i}] timestamp={get_em_timestamp(em)}")
+        lines.append(get_em_content(em).strip())
+        lines.append("")
+
+    block = "\n".join(lines).strip()
+    if len(block) > char_cap:
+        block = block[: max(0, char_cap - 3)].rstrip() + "..."
+    if logger is not None:
+        logger.info(
+            f"[AMM CriticMem] Built critic memory block chars={len(block)} worked={len(worked_selected)} avoid={len(avoid_selected)}"
+        )
+    return block
 

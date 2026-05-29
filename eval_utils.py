@@ -1,27 +1,20 @@
-
-# from transformers import T5Tokenizer, T5ForConditionalGeneration
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-from transformers import AutoConfig
-from math import ceil
 import random
 import re
-from sentence_transformers import SentenceTransformer
+import string
+import time
+import tiktoken
+from typing import List, Dict, Any, Optional
 
 import numpy as np
+from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-# OLD (Gemini 2.5 Flash, now deprecated):
-# from slow_agent.utils import completion_with_backoff
 
-# NEW: Qwen2.5-1M-Instruct via vLLM
 from llm.qwen_vllm_client import qwen_completion_vllm, QWEN_MODEL_NAME, VLLM_BASE_URL
 from data_utils.data_utils import formalize_action, recover_action
-import string 
-import editdistance
-import time 
-import tiktoken 
-from typing import List, Dict, Any, Optional, Set
-
 from slow_agent import local_llm
+
+
 def call_system2(
     prompt: str,
     llm_client=None,
@@ -57,7 +50,6 @@ def call_system2(
 action_type_description = [
     {"action_type": "WAIT()", "desc": "wait for something to be done, for example, an object on stove to be boiled"},
     {"action_type": "TELEPORT(room)", "desc": "directly go to a room such as TELEPORT(kitchen)"},
-    # {"action_type": "LOOK(object)", "desc": "look at an object"},
     {"action_type": "READ(object)", "desc": "read an object such as a recipe or a book"},
     {"action_type": "PICK(object)", "desc": "pick up an object and put it into your inventory"},
     {"action_type": "OPEN(object)", "desc": "open an object with doors before you search or put things in it. For example, OPEN(freezer), OPEN(blast furnace)."},
@@ -83,26 +75,6 @@ focus_on_count = {
 }
 
 rooms = ["hallway", "greenhouse", "green house", "kitchen", "bathroom", "outside", "workshop", "art studio", "foundry", "bedroom", "living room"]
-
-# ============================================================================
-# BASELINE SWIFTSAGE CORE LOGIC (DO NOT MODIFY)
-# ============================================================================
-# This section contains the baseline SwiftSage action proposal/validation logic.
-# These functions must behave identically to the original SwiftSage implementation:
-# - findValidActionNew: Baseline Swift action selection (exact match → SBERT → Jaccard)
-# - findValidActionWithSystem2: Baseline fast-agent heuristics (top-1 check, enable_system2 conditions)
-# - try_to_replace: Baseline action repair (strips rooms at end, caller checks membership)
-# - getFilteredValidActions: Baseline validActions filtering
-# - clean_history, get_model_output: Baseline utilities
-#
-# AMM/QWEN ADDITIONS (can be modified):
-# - T1/T2/T3/T4 retrieval blocks (clearly marked with === comments)
-# - Qwen vLLM integration for System 2 planning/grounding
-# - Memory injection utilities (build_swift_memories_block, etc.)
-#
-# WARNING: Do NOT alter baseline Swift selection semantics. AMM hooks run "around"
-# the baseline logic but must not change how Swift proposes/validates actions.
-# ============================================================================
 
 
 def is_action_failed(obs):
@@ -156,108 +128,11 @@ def is_action_failed(obs):
     return False
 
 
-def is_redundant_action(
-    action: str,
-    look: str,
-    recent_obs: List[str],
-    recent_actions: List[str],
-    noop_cooldown: Optional[Set[str]] = None
-) -> bool:
-    """
-    Check if an action is redundant (no-op) based on current state.
-    
-    Rules:
-    A) Redundant "open ..." detection:
-       - If last observation contains "already open" and action equals last action => redundant
-       - If look text indicates target is already open (patterns like "(that is open)") => redundant
-    B) Door-specific rule:
-       - If action starts with "open door to " and look indicates door is already open => redundant
-       - If look indicates door is closed => not redundant
-    C) No-op cooldown:
-       - If action is in noop_cooldown set => redundant (unless no alternatives)
-    
-    Args:
-        action: Action string to check
-        look: Current look/observation string
-        recent_obs: List of recent observations (most recent last)
-        recent_actions: List of recent actions (most recent last)
-        noop_cooldown: Optional set of actions that caused no-ops recently
-    
-    Returns:
-        True if action is redundant, False otherwise
-    """
-    action_lower = action.strip().lower()
-    look_lower = look.lower() if look else ""
-    
-    # C) Check no-op cooldown
-    if noop_cooldown and action in noop_cooldown:
-        return True
-    
-    # A) Check if last observation indicates redundancy
-    if recent_obs and len(recent_obs) > 0:
-        last_obs_lower = recent_obs[-1].lower()
-        
-        # Check for "already open" in last observation
-        if "already open" in last_obs_lower:
-            # If action equals last action, it's redundant
-            if recent_actions and len(recent_actions) > 0:
-                if action.lower() == recent_actions[-1].lower():
-                    return True
-        
-        # Check for other no-op patterns
-        noop_patterns = ["already closed", "already on", "already off", "already turned on", "already turned off"]
-        if any(pattern in last_obs_lower for pattern in noop_patterns):
-            if recent_actions and len(recent_actions) > 0:
-                if action.lower() == recent_actions[-1].lower():
-                    return True
-    
-    # B) Check look text for "open ..." actions
-    if action_lower.startswith("open "):
-        # Check if look indicates target is already open
-        # Patterns: "door to X (that is open)", "freezer (that is open)", "X (that is open)"
-        if "(that is open)" in look_lower:
-            # Extract target from action
-            target = action_lower[len("open "):].strip()
-            if target:
-                # Check if look mentions this target as open
-                # Simple heuristic: if target appears near "open" in look
-                target_words = set(target.split())
-                look_words = look_lower.split()
-                # Check if target words appear and "open" appears nearby
-                if target_words:
-                    for i, word in enumerate(look_words):
-                        if word in target_words:
-                            # Check nearby words for "open"
-                            window_start = max(0, i - 5)
-                            window_end = min(len(look_words), i + 5)
-                            window_text = " ".join(look_words[window_start:window_end])
-                            if "open" in window_text and "(that is open)" in look_lower:
-                                return True
-        
-        # B) Door-specific check
-        if action_lower.startswith("open door to "):
-            dest = action_lower[len("open door to "):].strip()
-            if dest:
-                # Check if look indicates this door is open
-                # Pattern: "door to <dest> (that is open)"
-                door_pattern_open = f"door to {dest} (that is open)"
-                door_pattern_open_alt = f"door to the {dest} (that is open)"
-                if door_pattern_open in look_lower or door_pattern_open_alt in look_lower:
-                    return True
-                
-                # Check if look indicates door is closed (not redundant)
-                door_pattern_closed = f"door to {dest} (that is closed)"
-                door_pattern_closed_alt = f"door to the {dest} (that is closed)"
-                if door_pattern_closed in look_lower or door_pattern_closed_alt in look_lower:
-                    return False  # Door is closed, action is not redundant
-    
-    return False
-
 def find_non_alpha_index(s):
     for i, c in enumerate(s):
         if not c.isalpha() and c != ' ':
             return i
-    return -1  # if no non-alpha character found 
+    return -1
 
 def clean_look(look, version="not_lite"):
     
@@ -585,10 +460,7 @@ def clean_obj_name(action):
     return action 
 
 def try_to_replace(action, validActions, look=None, inventory=None):
-    """
-    BASELINE: Try to repair an action to match a validAction.
-    Baseline behavior: strips rooms at the end. Caller must check membership.
-    """
+    """Repair an action string to match a valid environment action when possible."""
     if action.startswith("wait"):
         return "wait"
     if action in validActions:
@@ -649,8 +521,6 @@ def try_to_replace(action, validActions, look=None, inventory=None):
     return action 
         
 
-import openai  # make sure this is at the top of the file
-
 def rerun_swift_with_same_context(
     task_description: str,
     look: str,
@@ -674,7 +544,7 @@ def rerun_swift_with_same_context(
     objects: list,
     places: list,
     current_score: float,
-    retrieved_ems: list = None,  # For future use when we inject EMs into prompt
+    retrieved_ems: list = None,
 ) -> tuple:
     """Re-run the fast agent (Swift) once more and try to get a valid action.
     
@@ -704,16 +574,11 @@ def rerun_swift_with_same_context(
         objects: List of objects seen
         places: List of places visited
         current_score: Current score (for returns_to_go calculation)
-        retrieved_ems: List of retrieved episodic memories (for future EM injection)
+        retrieved_ems: Retrieved episodic memories for Swift prompt injection
     
     Returns:
-        (action, found_valid_in_top) where:
-        - action: The selected action (None if no valid action found)
-        - found_valid_in_top: Boolean indicating if a valid action was found in top predictions
+        (action, found_valid_in_top)
     """
-    # TODO: In future, prepend a "Past Episodes" or EM block to the input_str here
-    # using retrieved_ems. For now, we rebuild the same context as the original Swift call.
-    
     # Calculate returns_to_go (same logic as main loop)
     returns_to_go = 1.0 - float(current_score) * 0.01
     returns_to_go = round(returns_to_go, 2)
@@ -754,27 +619,31 @@ def rerun_swift_with_same_context(
     # Integrate episodic memories for Swift
     # FAIL-SAFE: Only inject if we have EMs and injection succeeds
     if retrieved_ems and len(retrieved_ems) > 0:
-        try:
-            from amm.formatters import build_swift_memories_block
-            # Invariant check: Ensure input_str is a real Swift prompt before injection
-            if "What action should you do next? </s>" not in input_str:
-                logger.debug(
-                    "[AMM SwiftMem] Swift EM injection called with non-Swift prompt "
-                    f"(missing final question, T1-second-pass). input_str_len={len(input_str)}. Not injecting."
-                )
-            else:
-                augmented_input = build_swift_memories_block(
-                    input_str=input_str,
-                    episodic_memories=retrieved_ems,
-                    trigger_context="T1-second-pass"
-                )
-                # CRITICAL: Only use augmented if it's not None (prevents overwriting with memory-only content)
-            if augmented_input is not None:
-                input_str = augmented_input
-                # If augmented_input is None, we silently use original prompt (baseline-equivalent)
-        except Exception as e:
-            # FAIL-SAFE: Log error but don't fail - continue with baseline prompt
-            logger.debug(f"[T1 Trigger] Swift memory integration failed (non-critical): {e}")
+        if args and args.get("disable_amm_swift_injection", False):
+            logger.info("[AMM SwiftMem] Swift injection disabled by flag; skipping memory block injection.")
+        else:
+            try:
+                from amm.formatters import build_swift_memories_block
+                augmented_input = None
+                # Invariant check: Ensure input_str is a real Swift prompt before injection
+                if "What action should you do next? </s>" not in input_str:
+                    logger.debug(
+                        "[AMM SwiftMem] Swift EM injection called with non-Swift prompt "
+                        f"(missing final question, T1-second-pass). input_str_len={len(input_str)}. Not injecting."
+                    )
+                else:
+                    augmented_input = build_swift_memories_block(
+                        input_str=input_str,
+                        episodic_memories=retrieved_ems,
+                        trigger_context="T1-second-pass"
+                    )
+                    # CRITICAL: Only use augmented if it's not None (prevents overwriting with memory-only content)
+                if augmented_input is not None:
+                    input_str = augmented_input
+                    # If augmented_input is None, we silently use original prompt (baseline-equivalent)
+            except Exception as e:
+                # FAIL-SAFE: Log error but don't fail - continue with baseline prompt
+                logger.debug(f"[T1 Trigger] Swift memory integration failed (non-critical): {e}")
     # If retrieved_ems is empty/None, we proceed with baseline prompt (no injection, no warning)
     
     # Call Swift model to get predictions
@@ -920,8 +789,11 @@ def findValidActionWithSystem2(
     # NOTE: swift_failure_count is tracked for metrics/debugging but does NOT control T1 ladder execution
     # Bypass T1 if forcing System 2 due to focus gating (Swift produced valid action, just filtered)
     if not found_valid_in_top and amm_client is not None:
+        disable_t1_ladder = bool(args and args.get("disable_amm_swift_injection", False))
+        if disable_t1_ladder:
+            logger.info("[T1] Disabled by flag; bypassing Swift recovery ladder -> Sage (T4)")
         # Skip T1 if forcing System 2 due to focus gating (not a true Swift failure)
-        if force_system_2 and force_system_2_reason == "focus_gate":
+        elif force_system_2 and force_system_2_reason == "focus_gate":
             logger.info("[T1] Bypassing T1 ladder (force_system_2=True, reason=focus_gate) → going directly to Sage (T4)")
         else:
             try:
@@ -1344,7 +1216,6 @@ def findValidActionWithSystem2(
 
         logger.info("PROMPT TO PLAN:\n" + prompt_to_plan)
         if llm is None:
-            # NEW: Qwen2.5-1M-Instruct via vLLM
             response_plan = qwen_completion_vllm(
                 prompt_to_plan,
                 max_tokens=2048,
@@ -1352,12 +1223,6 @@ def findValidActionWithSystem2(
                 top_p=1.0,
                 logger=logger.info,
             )
-            # OLD (Gemini 2.5 Flash, now deprecated):
-            # resp = completion_with_backoff(
-            #     model=gpt_version,
-            #     messages=[{"parts": [{"text": prompt_to_plan}]}]
-            # )    
-            # response_plan = resp.candidates[0].content.parts[0].text
         else:
             response_plan = local_llm.generate(prompt_to_plan, logger=logger.info)
 
@@ -1373,7 +1238,6 @@ def findValidActionWithSystem2(
         )
         logger.info("PROMPT TO NEXT ACTIONS:\n" + prompt_to_next_actions)
         if llm is None:
-            # NEW: Qwen2.5-1M-Instruct via vLLM
             response_next_actions = qwen_completion_vllm(
                 prompt_to_next_actions,
                 max_tokens=3072,
@@ -1381,13 +1245,6 @@ def findValidActionWithSystem2(
                 top_p=1.0,
                 logger=logger.info,
             )
-            # OLD (Gemini 2.5 Flash, now deprecated):
-            # resp2 = completion_with_backoff(
-            #     model=gpt_version,
-            #     messages=[{"parts": [{"text": prompt_to_next_actions}]}],
-            #     temperature=0, top_p=1
-            # )            
-            # response_next_actions = resp2.candidates[0].content.parts[0].text
         else:
             response_next_actions = local_llm.generate(prompt_to_next_actions)
 
@@ -1677,7 +1534,6 @@ def compose_prompt_to_plan(demos, useful_focus_on, task_desc, recent_actions, re
         prompt_to_plan.append(f"My instinct tells me that it might be reasonable to {fast_action} now but I'm not so sure.")
     if failed_messages:
         failed_messages = set(failed_messages)
-        failed_messages = set(failed_messages)
         prompt_to_plan.append("There are some error messages about my previous actions:")
         prompt_to_plan += failed_messages
     prompt_to_plan.append("Please review the task description and the previous observations and then answer the following questions to help me plan for efficiently completing the next subgoal.")
@@ -1752,60 +1608,6 @@ def parse_episode(content):
         return None
 
 
-def format_past_episodes(mem_list):
-    """Format a compact Past Episodes block from episodic memories.
-
-    mem_list: list of dicts with at least {timestamp, content}
-    Returns a string or empty string if nothing to show.
-    """
-    if not mem_list:
-        return ""
-
-    parsed = []
-    for m in mem_list[:10]:  # attempt parse beyond 5 in case of skips
-        content = m.get("content", "")
-        info = parse_episode(content)
-        if not info:
-            continue
-        parsed.append(info)
-        if len(parsed) >= 5:
-            break
-
-    if not parsed:
-        return ""
-
-    lines = ["Past Episodes (most related first, max 5)"]
-
-    # Build bullets
-    for p in parsed:
-        room = p["room"]
-        action = p["action"]
-        observation = p["observation"][:120]
-        rd = p["reward_delta"]
-        rd_str = ("+" if rd is not None and rd > 0 else "") + (f"{int(rd)}" if rd is not None and float(rd).is_integer() else f"{rd}")
-        # shorten task
-        task = p["task"].replace("\n", " ").strip()
-        if len(task) > 80:
-            task = task[:77] + "..."
-        bullet = f"• [{room}] — [{action}] → [{observation}] (Δscore: {rd_str}; task: \"{task}\")"
-        lines.append(bullet)
-
-    # Optional hint if same action in same room appears multiple times
-    freq = {}
-    for p in parsed:
-        key = (p["room"], p["action"])
-        freq[key] = freq.get(key, 0) + 1
-    common = sorted(freq.items(), key=lambda x: x[1], reverse=True)
-    if common and common[0][1] >= 2:
-        (room, action), _ = common[0]
-        lines.append(f"Hint: actions that helped in [{room}]: [{action}].")
-
-    block = "\n".join(lines)
-    # Hard cap length to ~1200 chars
-    if len(block) > 1200:
-        block = block[:1197] + "..."
-    return block
-
 def clean_history(recent_actions, recent_obs, recent_score, recent_reward, recent_locs):
     assert len(recent_actions) == len(recent_obs) == len(recent_score) == len(recent_reward) == len(recent_locs)
     N = len(recent_actions)
@@ -1875,56 +1677,5 @@ def post_process_generation(raw_pred):
     return result.strip()
 
 
-def gpt_select_valid(action, candidates, look, inventory, goal, logger, n=1, gpt_version="qwen2.5-1m-instruct", llm=None):  # Default changed from "gpt-4"
-    prompt_to_search = []
-    prompt_to_search.append("Let's play a text game.")
-    prompt_to_search.append(clean_look(look, version="all"))
-    prompt_to_search.append(inventory)
-    prompt_to_search.append("There are some action candidates as follows:")
-    for ac in candidates:
-        prompt_to_search.append(f"- {ac}")
-    prompt_to_search.append(f"\n I want to achieve this goal: {goal} but my action '{action}' is not in the candidate list.")
-    prompt_to_search.append(f"Please consider the objects in the room and inventory and my goal. Think carefully, and then select the best replacement from the list. If no one in the list is a good replacement, return 'none'.")
-    prompt_to_search.append(f"Selected action:") 
-
-    prompt_to_search = "\n".join(prompt_to_search)
-    logger("-"*30 + "prompt_to_search" + "-"*30)
-    logger("\n"+prompt_to_search)
-    logger("-"*35 + "-"*35)
-    if llm is None:
-        # NEW: Qwen2.5-1M-Instruct via vLLM
-        response_text = qwen_completion_vllm(
-            prompt_to_search,
-            max_tokens=256,
-            temperature=0.0,
-            top_p=1.0,
-            logger=logger,
-        )
-        selections = [response_text]  # vLLM returns single response, wrap in list for compatibility
-        # OLD (Gemini 2.5 Flash, now deprecated):
-        # responses = completion_with_backoff(model=gpt_version,
-        #        messages=[{"parts": [{"text": prompt_to_search}]}])
-        # selections = [responses.candidates[i].content.parts[0].text for i in range(n)]
-    else:    
-        selections = local_llm.generate(prompt_to_search)
-    return selections
-
-
-def rank_candidates_by_common_words(query, candidates):
-    """
-    Rank the candidates based on their edit distance to the query.
-    """
-
-    # the first word must be the same 
-    candidates = [va for va in candidates if va.split()[0] == query.split()[0]]
-    
-    # Compute the edit distance between each candidate and the query
-    num_commons = [len(set(query.split()) & set(candidate.split())) for candidate in candidates]
-    
-    # Sort the candidates based on their distance to the query
-    ranked_candidates = [candidate for _, candidate in sorted(zip(num_commons, candidates), reverse=True)]
-    
-    return ranked_candidates
-
-if __name__ == "__main__":  
+if __name__ == "__main__":
     print()

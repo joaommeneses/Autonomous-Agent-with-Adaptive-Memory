@@ -11,8 +11,8 @@ import argparse
 from tqdm import trange
 from scienceworld import ScienceWorldEnv
 from data_utils.data_utils import add_current_place, add_current_objects, sanitizeStr, formalize_action
-from data_utils.data_utils import compose_instance_v1, compose_instance_v1_1, compose_instance_v2, compose_instance_v3, compose_instance_v4
-from eval_utils import load_model, findValidActionNew, load_variation, get_model_output, findValidActionWithSystem2, getFilteredValidActions, sbert_search, clean_look, is_action_failed 
+from data_utils.data_utils import compose_instance_v4
+from eval_utils import load_model, load_variation, get_model_output, findValidActionWithSystem2, getFilteredValidActions, sbert_search, clean_look, is_action_failed 
 from eval_utils import try_to_replace, rooms, clean_history, get_current_room, clean_obj_name, focus_on_count
 from srm.srm_gate import SRMGate
 from srm.action_types import normalize_action_text, parse_action
@@ -24,11 +24,7 @@ from srm.critic import (
     run_critic_once,
 )
 
-# AMM imports (used for EM writing and T3 retrieval, not for proactive Swift retrieval)
 from amm.config import DEFAULT_CONFIG
-
-
-# from scienceworld
 from py4j.java_gateway import JavaGateway, GatewayParameters, launch_gateway, CallbackServerParameters
 from scienceworld.constants import BASEPATH, DEBUG_MODE, ID2TASK, JAR_PATH, NAME2ID
 from scienceworld.utils import infer_task
@@ -38,7 +34,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class MyScienceWorldEnv(ScienceWorldEnv):
-    # it is only used for fixing the logging error --> logger.info(f"ScienceWorld server running on {port}") 
     def __init__(self, taskName=None, serverPath=None, envStepLimit=100):
         serverPath = serverPath or JAR_PATH  # Use the builtin jar.
 
@@ -93,8 +88,6 @@ class MyScienceWorldEnv(ScienceWorldEnv):
         self.goldPathGenerated = False
 
 
-
-import logging
 from logging import INFO, WARN
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -102,7 +95,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MAX_SAGE_CALLS_PER_ENV_STEP = 1
 STUCK_K = 3
 SAGE_COOLDOWN_STEPS = 2
-MAX_CRITIC_CALLS_PER_EPISODE = 6
+MAX_CRITIC_CALLS_PER_EPISODE = 3
 CRITIC_COOLDOWN_STEPS = 5
 CRITIC_BACKOFF_STEPS = 10
 
@@ -170,44 +163,9 @@ def get_file_name(args, task_num):
     filenameOutPrefixSeed = args["output_path"] + "task" + str(task_num)
 
     return filenameOutPrefixSeed
-  
 
 
-# ============================================================================
-# BASELINE SWIFT BEHAVIORAL CONTRACT (enforced when use_amm=False)
-# ============================================================================
-# Baseline Swift must match original implementation exactly:
-# 1. Prompt: compose_instance_v4() builds prompt with exact structure:
-#    - Task description, Time/Score/ReturnsToGo, Action history (last 5),
-#    - Current environment (look, inventory, visited rooms)
-#    - No memory/guidance blocks injected
-# 2. Model: get_model_output() calls Flan-T5 with:
-#    - max_length=16, beams=5 (from args["beams"])
-#    - No stop tokens modification
-# 3. Parsing: findValidActionNew() uses:
-#    - Exact match against validActions first (top k=5)
-#    - SBERT similarity fallback if no exact match
-#    - Jaccard fallback if SBERT unavailable
-# 4. Validation: getFilteredValidActions() provides same validActions list
-#    - Same filtering rules (door, focus constraints)
-#    - Same sorting/truncation
-# 5. Invalid action handling: 
-#    - If no valid action found → fallback to "wait" (queued in buffer)
-#    - No retry loop (single Swift call per step)
-# 6. No AMM calls: No retrieval, no writing, no memory injection
-# 7. No Sage calls: No System 2 planning/grounding
-# ============================================================================
-
-# Example user input console, to play through a game.
 def eval(args, task_num, logger):
-    # if args["compose_mode"] == "v1":
-    #     compose_instance = compose_instance_v1
-    # elif args["compose_mode"] == "v1_1":
-    #     compose_instance = compose_instance_v1_1
-    # elif args["compose_mode"] == "v2":
-    #     compose_instance = compose_instance_v2
-    # elif args["compose_mode"] == "v3":
-    #     compose_instance = compose_instance_v3
     if args["compose_mode"] == "v4":
         compose_instance = compose_instance_v4
     
@@ -216,8 +174,6 @@ def eval(args, task_num, logger):
         with open(args["demo_file"]) as f:
             demo_data = json.load(f)
     
-    # Initialize environment
-    # env = ScienceWorldEnv("", args["jar_path"], envStepLimit = args["env_step_limit"], threadNum = 0)
     env = MyScienceWorldEnv("", args["jar_path"], envStepLimit = args["env_step_limit"])
     taskNames = env.getTaskNames()
     taskName = taskNames[task_num]
@@ -226,35 +182,24 @@ def eval(args, task_num, logger):
 
     variations = load_variation(env, args, task_num, logger)
     filenameOutPrefixSeed = get_file_name(args, task_num)
-    # plans = get_plans(args)
     gpt_version = args["gpt_version"]
     scores = []
 
-    # === FEATURE FLAGS: Control AMM and SRM architecture ===
-    # Sage/System 2 is always enabled (controlled by slow_agent flag)
-    # When use_amm=False: baseline SwiftSage mode (no AMM, but Sage available)
     enable_amm = bool(args.get("use_amm", False))
     amm_write_only = bool(args.get("amm_write_only", False))
     amm_retrieval_enabled = enable_amm and (not amm_write_only)
-    use_sage = True  # Sage/System 2 is always enabled (requires slow_agent=True)
-    enable_srm = not args.get("disable_srm", False)  # Enable SRM (Self-Reflection Module), disabled via --disable_srm
+    use_sage = True
+    enable_srm = not args.get("disable_srm", False)
     if amm_write_only and not enable_amm:
         logger.warning("[AMM] --amm_write_only has no effect because AMM is disabled (--use_amm not set)")
-    # =========================================================
 
-    # === AMM INIT (only when use_amm=True) ===
     amm_client = None
     wm = None
     if enable_amm:
         from amm.client_letta import AMMLettaClient, LettaConfig
         from amm.working_memory import WorkingMemory
         from amm.writer import write_success, write_nearmiss, write_avoidance, create_memory_record
-        from amm.schema import MemoryRecord
-        from amm.config import DEFAULT_CONFIG
-        from amm.tagging import classify_episode
-        
-        # Initialize AMM client and working memory
-        # Get API token and agent ID from environment or config
+
         letta_api_token = os.getenv("LETTA_API_TOKEN")
         letta_agent_id = os.getenv("LETTA_AGENT_ID")
         
@@ -275,18 +220,15 @@ def eval(args, task_num, logger):
         logger.info(f"[AMM] Using agent ID: {letta_agent_id}")
     else:
         logger.info("[Baseline] Running in baseline SwiftSage mode (use_amm=False, Sage available via slow_agent)")
-    # =================
 
     for variation in variations:
         if args["debug_var"] >=0 and variation != args["debug_var"]:
             logger.info(f"Skipping the Var: {variation} because we only focus on args['debug_var'']={args['debug_var']}")
             continue 
-        # train_data = []
         env.load(taskName, variation, args["simplification_str"], generateGoldPath=True)
         task_description = env.taskdescription()[18:]
         logger.info(f"task_description = {task_description}")
         
-        # === AMM HOOK: EPISODE RESET (only when use_amm=True) ===
         if enable_amm and wm is not None:
             wm.reset()
             wm.pending_subgoal = task_description
@@ -295,8 +237,7 @@ def eval(args, task_num, logger):
                 logger.info("[AMM] Mode=WRITE_ONLY (writes enabled, retrieval+augmentation disabled)")
             else:
                 logger.info("[AMM] Mode=FULL (writes + retrieval/augmentation enabled)")
-        # ================================
-        # task_description = env.taskdescription()  
+
         recent_actions = ["look around"]
         recent_obs = ["N/A"]
         recent_locs = []
@@ -304,37 +245,27 @@ def eval(args, task_num, logger):
         recent_looks_flatten = []
         recent_scores = [0.0,]
         recent_reward = [0.0]
-        # recent_actions_without_open = []
         places = []
-        objects = [] 
-        # bad_words_ids = None
- 
+        objects = []
+
         obs, info = env.reset()
         current_place = get_current_room(info['look'])        
         recent_locs.append(current_place)
         recent_looks[current_place] = info["look"]
         recent_looks_flatten.append(info["look"])
-        # recent_looks[current_place] = info["look"]
 
         prev_obs = 'N/A'
         prev_action = 'look around'
-        # prev_look = ''
-        # prev_inv = ''
 
         done = False
         score = 0.0
         last_score = 0.0
         step = 0
 
-        # The env has an internal step count, some actions like look around are free
-        # however, the t5 model only generates the action "look around", which will result in a dead loop below
-        # so the max_steps here is only used to avoid the model generating the same action forever
-        
-        # Kill Analysis Paralysis - can be tuned as needed
         max_steps = args["env_step_limit"] * 2
- 
+
         action_buffer = []
-        obs_buffer = [] # guess_obs_list
+        obs_buffer = []
         buffer_owner = None  # None | "sage" | "critic"
         last_time_system2_steps = [-1]
         last_time_system2 = -1
@@ -353,7 +284,7 @@ def eval(args, task_num, logger):
             gate_drop_streak = None
             gate_drop_step = None
             force_system2_once_reason = None
-        action_source = None  # Track action source: "swift" | "sage" | "buffer"
+        action_source = None
         focus_limit = int(focus_on_count.get(str(task_num), 1))
         focus_used = 0
         sage_calls_this_env_step = 0
@@ -638,6 +569,38 @@ def eval(args, task_num, logger):
                                 )
                             history_lines.append(f"room={current_place} | action={action} | obs={sanitizeStr(obs)[:160]}")
                             inventory_now = str(env.inventory())
+                            critic_em_block = None
+                            if enable_srm and enable_amm and amm_retrieval_enabled and amm_client is not None:
+                                try:
+                                    from amm.retrieve_for_critic import retrieve_memories_for_critic
+                                    critic_em_block, critic_em_stats = retrieve_memories_for_critic(
+                                        amm_client=amm_client,
+                                        task_description=task_description,
+                                        current_room=current_place,
+                                        look=info["look"],
+                                        inventory=inventory_now,
+                                        recent_history_lines=history_lines,
+                                        stagnation_reasons=pending_critic_report.reasons,
+                                        stagnation_metrics=pending_critic_report.metrics,
+                                        logger=logger,
+                                        focus_used=focus_used,
+                                        focus_limit=focus_limit,
+                                    )
+                                    if critic_em_block is not None and not str(critic_em_block).strip():
+                                        critic_em_block = None
+                                    logger.info(
+                                        f"[SRM Critic][AMM] injected={bool(critic_em_block)} "
+                                        f"worked={critic_em_stats.get('worked_retrieved', 0)} "
+                                        f"avoid={critic_em_stats.get('avoid_retrieved', 0)} "
+                                        f"chars={critic_em_stats.get('injected_chars', 0)} "
+                                        "branch=deferred"
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"[SRM Critic][AMM] retrieval failed (branch=deferred): {e}")
+                            if critic_em_block is not None:
+                                logger.info(f"[SRM Critic][AMM] EPISODIC_BLOCK:\n{critic_em_block}")
+                            else:
+                                logger.info("[SRM Critic][AMM] EPISODIC_BLOCK: <NONE>")
                             prompt = build_critic_prompt(
                                 task_description=task_description,
                                 stagnation_reasons=pending_critic_report.reasons,
@@ -649,7 +612,15 @@ def eval(args, task_num, logger):
                                 valid_actions=valid_actions_list_for_critic,
                                 focus_used=focus_used,
                                 focus_limit=focus_limit,
+                                episodic_memories_block=critic_em_block,
                             )
+                            has_ep_section = "EPISODIC_MEMORIES (non-binding evidence):" in prompt
+                            if critic_em_block is not None:
+                                logger.info(
+                                    f"[SRM Critic][AMM] final_prompt_has_ep_section={has_ep_section} "
+                                    f"block_chars={len(critic_em_block)} branch=deferred"
+                                )
+                            logger.info(f"[SRM Critic] FINAL_PROMPT:\n{prompt}")
                             logger.info(
                                 f"[SRM Critic] prompt_meta: valid_actions_n={len(valid_actions_list_for_critic)}, "
                                 f"history_n={len(history_lines)}, inv_chars={len(inventory_now)}, look_chars={len(info['look'])}"
@@ -1227,6 +1198,38 @@ def eval(args, task_num, logger):
                                 )
                             history_lines.append(f"room={current_place} | action={action} | obs={sanitizeStr(obs)[:160]}")
                             inventory_now = str(env.inventory())
+                            critic_em_block = None
+                            if enable_srm and enable_amm and amm_retrieval_enabled and amm_client is not None:
+                                try:
+                                    from amm.retrieve_for_critic import retrieve_memories_for_critic
+                                    critic_em_block, critic_em_stats = retrieve_memories_for_critic(
+                                        amm_client=amm_client,
+                                        task_description=task_description,
+                                        current_room=current_place,
+                                        look=info["look"],
+                                        inventory=inventory_now,
+                                        recent_history_lines=history_lines,
+                                        stagnation_reasons=stagnation_report.reasons,
+                                        stagnation_metrics=stagnation_report.metrics,
+                                        logger=logger,
+                                        focus_used=focus_used,
+                                        focus_limit=focus_limit,
+                                    )
+                                    if critic_em_block is not None and not str(critic_em_block).strip():
+                                        critic_em_block = None
+                                    logger.info(
+                                        f"[SRM Critic][AMM] injected={bool(critic_em_block)} "
+                                        f"worked={critic_em_stats.get('worked_retrieved', 0)} "
+                                        f"avoid={critic_em_stats.get('avoid_retrieved', 0)} "
+                                        f"chars={critic_em_stats.get('injected_chars', 0)} "
+                                        "branch=immediate"
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"[SRM Critic][AMM] retrieval failed (branch=immediate): {e}")
+                            if critic_em_block is not None:
+                                logger.info(f"[SRM Critic][AMM] EPISODIC_BLOCK:\n{critic_em_block}")
+                            else:
+                                logger.info("[SRM Critic][AMM] EPISODIC_BLOCK: <NONE>")
                             prompt = build_critic_prompt(
                                 task_description=task_description,
                                 stagnation_reasons=stagnation_report.reasons,
@@ -1238,7 +1241,15 @@ def eval(args, task_num, logger):
                                 valid_actions=valid_actions_list_for_critic,
                                 focus_used=focus_used,
                                 focus_limit=focus_limit,
+                                episodic_memories_block=critic_em_block,
                             )
+                            has_ep_section = "EPISODIC_MEMORIES (non-binding evidence):" in prompt
+                            if critic_em_block is not None:
+                                logger.info(
+                                    f"[SRM Critic][AMM] final_prompt_has_ep_section={has_ep_section} "
+                                    f"block_chars={len(critic_em_block)} branch=immediate"
+                                )
+                            logger.info(f"[SRM Critic] FINAL_PROMPT:\n{prompt}")
                             logger.info(
                                 f"[SRM Critic] prompt_meta: valid_actions_n={len(valid_actions_list_for_critic)}, "
                                 f"history_n={len(history_lines)}, inv_chars={len(inventory_now)}, look_chars={len(info['look'])}"
@@ -1612,10 +1623,32 @@ def parse_args():
     parser.add_argument("--baseline", action="store_true", default=False, help=argparse.SUPPRESS)
     parser.add_argument("--enable-amm", dest="use_amm", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--enable-srm", dest="disable_srm", action="store_false", help=argparse.SUPPRESS)
-    parser.add_argument("--use_amm", "--use-amm", dest="use_amm", action="store_true", default=False, help="Enable AMM (Adaptive Memory Module) retrieval and writing. Sage/System 2 is always available when slow_agent=True.")
+    parser.add_argument("--use_amm", dest="use_amm", action="store_true", default=False, help=argparse.SUPPRESS)
+    parser.add_argument("--use-amm", dest="mode_use_amm", action="store_true", default=False, help="Run baseline + AMM only (SRM disabled).")
+    parser.add_argument("--use-srm", dest="mode_use_srm", action="store_true", default=False, help="Run baseline + SRM only (AMM disabled).")
+    parser.add_argument("--use-full", dest="mode_use_full", action="store_true", default=False, help="Run full system (AMM + SRM).")
     parser.add_argument("--amm_write_only", "--amm-write-only", dest="amm_write_only", action="store_true", default=False, help="AMM write-only mode: keep writes enabled but disable retrieval and prompt augmentation.")
-    parser.add_argument("--disable_srm", "--disable-srm", dest="disable_srm", action="store_true", default=False, help="Disable SRM (Self-Reflection Module).")
+    parser.add_argument("--disable_amm_swift_injection", dest="disable_amm_swift_injection", action="store_true", default=False, help=argparse.SUPPRESS)
+    parser.add_argument("--disable-amm-swift-injection", dest="disable_amm_swift_injection", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--disable-swift-injection", dest="disable_amm_swift_injection", action="store_true", help="Disable AMM episodic-memory injection into Swift T1 retries.")
+    parser.add_argument("--disable_srm", "--disable-srm", dest="disable_srm", action="store_true", default=True, help="Disable SRM (Self-Reflection Module).")
     args = parser.parse_args()
+    mode_count = int(bool(args.mode_use_amm)) + int(bool(args.mode_use_srm)) + int(bool(args.mode_use_full))
+    if mode_count > 1:
+        parser.error("Mode flags are mutually exclusive: choose only one of --use-amm, --use-srm, --use-full.")
+    if args.mode_use_amm:
+        args.use_amm = True
+        args.disable_srm = True
+    elif args.mode_use_srm:
+        args.use_amm = False
+        args.disable_srm = False
+    elif args.mode_use_full:
+        args.use_amm = True
+        args.disable_srm = False
+
+    if args.disable_amm_swift_injection and not args.use_amm:
+        parser.error("--disable-swift-injection requires AMM enabled (use --use-amm or --use-full, or set --use_amm).")
+
     params = vars(args)
     return params
 

@@ -126,7 +126,6 @@ def write_success(client: AMMLettaClient, rec: MemoryRecord, tag: str = None, me
     preview = ' | '.join([line for line in content_lines[:2] if line.strip()])
     logger.info(f"[AMM Writer] Formatted content length: {len(content)} chars, preview: {preview}")
     
-    # TODO: Add de-dup hook (amm/dedup.py) in future phases
     return client.add_tagged(payload)
 
 

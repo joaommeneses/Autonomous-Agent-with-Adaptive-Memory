@@ -20,19 +20,15 @@ class SRMGate:
         self.focus = FocusTracker()
 
     def set_focus_category(self, focus_category: Optional[str]):
-        # No automatic category inference in M1 finalization.
         self.focus.focus_category = focus_category
 
     def maybe_set_focus_target_from_planning(self, planning_text: str):
-        # Disabled by design: no focus_target inference from planning text.
         return
 
     def set_focus_target_from_planning(self, planning_text: str, focus_category: Optional[str] = None):
-        # Disabled by design: no focus_target inference from planning text.
         return
 
     def maybe_set_focus_target_from_task(self, task_description: str):
-        # Disabled by design: no focus_target inference from task text.
         return
 
     def mark_focus_executed(self, action: str, obs: str):
@@ -64,8 +60,6 @@ class SRMGate:
                 source=source,
             )
 
-        # Shared per-task focus cap guard (applies to Swift/Sage/Buffer/repair paths).
-        # We enforce this here so one gate controls all action sources.
         if parsed.verb == "focus":
             focus_limit = state2.get("focus_limit")
             focus_used = state2.get("focus_used", 0)
