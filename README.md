@@ -7,9 +7,6 @@ This repository extends [**SwiftSage**](https://arxiv.org/abs/2305.17390) — a 
 
 The implementation keeps the original SwiftSage **Swift** (fast, imitation-learned policy) and **Sage** (slow, LLM-based planner) backbone. AMM and SRM plug into the existing escalation path in `eval_agent_fast_slow.py` / `eval_utils.py`.
 
-> **Paper:** Add your thesis / preprint title, authors, and PDF link here once available.  
-> The architecture and flags below match the code in this repo.
-
 ---
 
 ## Relation to SwiftSage
