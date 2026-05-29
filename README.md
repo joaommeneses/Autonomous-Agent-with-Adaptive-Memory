@@ -1,4 +1,4 @@
-# SwiftSage + Adaptive Memory & Self-Reflection
+# Cognitive Extensions for Dual Process Language Agents: Memory and Self-Reflection in Interactive Environments
 
 This repository extends [**SwiftSage**](https://arxiv.org/abs/2305.17390) — a dual-process agent for complex interactive reasoning — with two modules developed in this thesis work:
 
