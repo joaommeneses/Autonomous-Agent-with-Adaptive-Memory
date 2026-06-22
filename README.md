@@ -191,17 +191,6 @@ Point `--jar_path` to the ScienceWorld jar if not using the package default (see
 
 ---
 
-## Baselines
-
-Scripts under `baselines/` reproduce comparisons from the SwiftSage paper setting where applicable:
-
-- `eval_agent_saycan.py`, `eval_agent_reflexion.py`, `eval_agent_fast_only.py`  
-- Shared utilities: `eval_utils.findValidActionNew`, etc.
-
-See also the official [ScienceWorld](https://github.com/allenai/ScienceWorld) baselines.
-
----
-
 ## Acknowledgments
 
 This codebase builds on [SwiftSage](https://github.com/yuchenlin/SwiftSage) (Allen AI / USC INK) and the [ScienceWorld](https://sciworld.apps.allenai.org) benchmark. Episodic memory is stored and retrieved via [Letta](https://github.com/letta-ai/letta). System 2 reasoning uses [Qwen2.5](https://huggingface.co/Qwen) served with [vLLM](https://github.com/vllm-project/vllm).
